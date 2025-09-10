@@ -1,6 +1,6 @@
 {
   "name": "dnssec-server",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "📡 Pure JavaScript authoritative DNS server for Node.js with built-in DNSSEC, dynamic zones, and modern record support.",
   "main": "index.js",
   "type": "commonjs",
@@ -46,5 +46,15 @@
   "dependencies": {
     "@noble/curves": ">=1.9.6",
     "@noble/hashes": ">=1.8.0"
-  }
+  },
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    },
+    {
+      "type": "opencollective",
+      "url": "https://opencollective.com/colocohen"
+    }
+  ]
 }

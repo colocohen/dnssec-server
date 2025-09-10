@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/colocohen/dnssec-server/raw/main/dnssec-server.svg" width="550" alt="dnssec-server"/>
+  <img src="https://github.com/colocohen/dnssec-server/raw/main/dnssec-server.svg" width="100%" alt="dnssec-server"/>
 </p>
 
 <h1 align="center">dnssec-server</h1>
@@ -23,15 +23,14 @@
   <img src="https://img.shields.io/github/license/colocohen/dnssec-server?color=brightgreen" alt="license">
 </p>
 
----
 
 # Table of Contents
 
 - [✨ Why this library?](#why-this-library)
 - [📦 Install](#install)
 - [🚀 Quick Start](#quick-start)
-- [⚙️ API Overview](#api-overview)
-  - [`DNSServer.createServer(options, handler)`](#dnsservercreateserveroptions-handler)
+- [⚙️ API](#api)
+  - [`createServer(options, handler)`](#createserveroptions-handler)
   - [Request (`req`) object](#request-req-object)
   - [Response (`res`) object](#response-res-object)
 - [🔐 Enabling DNSSEC](#-enabling-dnssec)
@@ -39,13 +38,14 @@
   - [2. Add DS at your registrar (KSK)](#2-add-ds-at-your-registrar-ksk)
   - [3. Wire DNSSEC into the server](#3-wire-dnssec-into-the-server)
   - [4. Verify](#4-verify)
+- [📦 Migrating from Zone Files](#-migrating-from-zone-files)
+- [🔎 Understanding ECS (EDNS Client Subnet)](#understanding-ecs-edns-client-subnet)
 - [🧩 Dynamic DNS Recipes (what you can build)](#dynamic-dns-recipes-what-you-can-build)
   - [Geo Load Balancer by client IP / ECS](#geo-load-balancer-by-client-ip--ecs)
   - [Blue/Green & Canary releases](#bluegreen--canary-releases)
   - [Service discovery with SVCB/HTTPS](#service-discovery-with-svcbhttps)
   - [Regional failover with SOA/NS health](#regional-failover-with-soans-health)
 - [📜 Supported Record Types (spec‑aligned)](#-supported-record-types-spec-aligned)
-- [EDNS(0) & ECS](#edns0--ecs)
 - [Performance Notes](#performance-notes)
 - [Troubleshooting FAQ](#troubleshooting-faq)
 - [Roadmap](#roadmap)
@@ -53,7 +53,6 @@
 - [License](#license)
 - [References](#references)
 
----
 
 # ✨ Why this library?
 
@@ -65,9 +64,8 @@ These are robust and widely used, but they come with trade-offs:
 
 For modern stacks that are **API-driven, containerized, and globally distributed**, this is painful and slow.
 
----
 
-**dnssec-server** takes a different approach: it is a **pure JavaScript authoritative DNS server** designed to live *inside your Node.js application* and give you **DNS as code**.  
+`dnssec-server` takes a different approach: it is a **pure JavaScript authoritative DNS server** designed to live *inside your Node.js application* and give you **DNS as code**.  
 
 - 🛡️ **DNSSEC at runtime** — responses are signed on the fly (RRSIG, DNSKEY, NSEC/NSEC3). No offline signer, no cron jobs, no external toolchain.  
 - ⚡ **Dynamic zones** — answers are computed from logic you write in JavaScript. Use client IP/ECS to return the nearest PoP, shift traffic with weighted canaries, or implement feature-flagged DNS in seconds.  
@@ -75,7 +73,6 @@ For modern stacks that are **API-driven, containerized, and globally distributed
 - 🧩 **Simple API surface** — just one request/response handler where you push records and call `res.send()`. No need to learn zone file syntax.  
 - 🔧 **Embeddable** — run it standalone as your authoritative DNS, or embed directly in microservices that need fine-grained control.  
 
----
 
 This makes **dnssec-server** especially useful when:
 - You want DNS decisions tied directly to application logic (load balancing, canaries, failover).  
@@ -85,7 +82,6 @@ This makes **dnssec-server** especially useful when:
 
 In short: **dnssec-server** lets you treat DNS as part of your codebase — not as an external, opaque system.
 
----
 
 # 📦 Install
 
@@ -93,7 +89,6 @@ In short: **dnssec-server** lets you treat DNS as part of your codebase — not 
 npm i dnssec-server
 ```
 
----
 
 # 🚀 Quick Start
 
@@ -147,27 +142,30 @@ DNSServer.createServer({
 });
 ```
 
----
 
-# ⚙️ API Overview
+# ⚙️ API
 
-## `DNSServer.createServer(options, handler)`
+## `createServer(options, handler)`
 
 Creates and starts an authoritative DNS server.
 
 **Parameters**
 
 - `options`
-  - `udp` *(boolean | { port?: number, address?: string })* — enable/disable UDP transport (default: **enabled**, port 53 unless overridden).
-  - `tcp` *(boolean | { port?: number, address?: string })* — enable/disable TCP transport (default: **enabled**, port 53 unless overridden).
-  - `tls` *(false | { port?: number, address?: string, SNICallback?: (servername, cb) => void })* — enable DNS‑over‑TLS (default: **disabled**). Supply an `SNICallback` that returns a `SecureContext`.
-  - `dnssec` *(optional)* — `{ keyCallback: (signersName: string, cb: (err, material|null) => void) }`. See [DNSSEC](#-enabling-dnssec).
+  - `udp` 
+  *(boolean | { port?: number, address?: string })* — enable/disable UDP transport (default: **enabled**, port 53 unless overridden).
+  - `tcp` 
+  *(boolean | { port?: number, address?: string })* — enable/disable TCP transport (default: **enabled**, port 53 unless overridden).
+  - `tls` 
+  *(false | { port?: number, address?: string, SNICallback?: (servername, cb) => void })* — enable DNS‑over‑TLS (default: **disabled**). Supply an `SNICallback` that returns a `SecureContext`.
+  - `dnssec` *(optional)*
+  `{ keyCallback: (signersName: string, cb: (err, material|null) => void) }`. See [DNSSEC](#-enabling-dnssec).
   - Other advanced knobs may exist; consult source for current options.
-- `handler(req, res)` — your request handler. Populate `res.answers` / `res.authority` / `res.additional` then call `res.send()`.
+- `handler(req, res)`
+  your request handler. Populate `res.answers` / `res.authority` / `res.additionals` then call `res.send()`.
 
 > **Note**: Defaults above align with common expectations; if you need precise behavior (binding interfaces/ports, concurrency, etc.) refer to the code and examples.
 
----
 
 ## Request (`req`) object
 
@@ -186,14 +184,13 @@ Properties commonly used in logic:
 - `ecsSourcePrefixLength` *(number | undefined)* — ECS source prefix length.
 - `ednsOptions` *(array | undefined)* — raw EDNS options list if you need to inspect.
 
----
 
 ## Response (`res`) object
 
 - `header` — mutate flags/rcode:
   - `res.header.aa = true` *(default authoritative)*
   - `res.header.rcode = 0` *(0=NOERROR, 3=NXDOMAIN, 2=SERVFAIL, ...)*
-- `answers`, `authority`, `additional` — **arrays of RRs**. Each RR is `{ name, type, class:'IN', ttl, data }` (see [Supported Types](#-supported-record-types-spec-aligned)).
+- `answers`, `authority`, `additionals` — **arrays of RRs**. Each RR is `{ name, type, class:'IN', ttl, data }` (see [Supported Types](#-supported-record-types-spec-aligned)).
 - `send()` — finalize and transmit the response. You can call it once per query.
 
 > When `flag_do` is set and DNSSEC is configured, responses are signed automatically (RRSIG + DNSKEY/NSEC\* as needed).
@@ -201,7 +198,7 @@ Properties commonly used in logic:
 
 ## 🔧 `encodeMessage` / `decodeMessage`
 
-For advanced use cases, **dnssec-server** also exposes low-level primitives to
+For advanced use cases, `dnssec-server` also exposes low-level primitives to
 **parse** and **serialize** raw DNS messages.  
 This is useful if you want to:
 
@@ -228,13 +225,11 @@ query.answers.push({
 const wire = encodeMessage(query);
 ```
 
----
 
 # 🔐 Enabling DNSSEC
 
 This section explains how to generate DNSSEC material with the helper function and install it at both your **registrar (e.g., Namecheap)** and in your **DNS zone**.
 
----
 
 ## 1. Generate Keys with `buildDnssecMaterial`
 
@@ -276,7 +271,6 @@ Example output:
 }
 ```
 
----
 
 ## 2. Add DS at your registrar (KSK)
 
@@ -295,7 +289,6 @@ Example:
 
 ⚠️ Only the **KSK** produces a DS record for the registrar. The **ZSK** is not used here.
 
----
 
 ## 3. Wire DNSSEC into the server
 
@@ -339,21 +332,50 @@ DNSServer.createServer({
 - You can persist `dnssec_material_obj` to disk and load it on startup to keep keys stable across restarts.
 - To rotate ZSKs later, generate a new `zsk` and return it alongside the existing KSK; the server will continue serving a valid chain.
 
----
 
 ## 4. Verify
 
 After propagation, test with:
 
 ```bash
-dig +dnssec example.com DS
 dig +dnssec example.com DNSKEY
 dig +dnssec example.com A
 ```
 
-Or use [DNSViz](https://dnsviz.net/) to confirm everything validates.
+Or use [dnssec-debugger.verisignlabs.com](https://dnssec-debugger.verisignlabs.com/ojos.tv) to confirm everything validates.
 
----
+
+# 📦 Migrating from Zone Files
+
+Many users already have their DNS data in a traditional **zone file** (BIND-style).  
+We plan to provide a simple migration path so you can load an existing zone file directly into this library, without rewriting records manually.  
+
+**This feature is coming soon (TBD).**
+
+
+# 🔎 Understanding ECS (EDNS Client Subnet)
+
+When your DNS server receives a query, the field `req.remoteAddress` does **not** usually show the real end-user’s IP.  
+Instead, it shows the **resolver** that made the query on the client’s behalf — typically the ISP’s resolver, or a public one like Google (8.8.8.8) or Cloudflare (1.1.1.1).
+
+To help authoritative servers make smarter decisions (e.g. geo-based routing), some resolvers add the **EDNS Client Subnet (ECS)** option.  
+ECS includes only a **prefix** of the user’s real IP address, never the full value, in order to preserve privacy.  
+
+For example:
+ECS=200.118.80.0/24
+
+This means the real client was somewhere in the `200.118.80.xxx` range, while the last octet was zeroed out.  
+The `/24` indicates how many bits of the address are valid.  
+
+In this library, ECS data is exposed through convenient fields:
+
+- `req.ecsAddress` → the truncated client address (e.g. `200.118.80.0`)  
+- `req.ecsSourcePrefixLength` → the prefix length (e.g. `24`)  
+
+Resolvers that do not send ECS will simply yield `ECS=-/-`.
+
+ECS is useful if you want to implement **geo-location logic, load balancing, or analytics** that take into account where users are actually coming from, rather than just the resolver’s IP.
+
 
 # 🧩 Dynamic DNS Recipes (what you can build)
 
@@ -377,7 +399,15 @@ function handler(req, res){
     'us-east': '198.51.100.7',
     'eu-west': '203.0.113.42'
   };
-  res.answers.push({ name: req.name, type: 'A', class: 'IN', ttl: 30, data: { address: targets[region] }});
+  res.answers.push({ 
+    name: req.name, 
+    type: 'A', 
+    class: 'IN', 
+    ttl: 30, 
+    data: { 
+      address: targets[region] 
+    }
+  });
   res.send();
 }
 ```
@@ -387,7 +417,6 @@ function handler(req, res){
 - Prefer `ecsAddress` when available; many public resolvers (e.g., 8.8.8.8) include ECS.
 - Keep TTL short for agility; adjust by record set.
 
----
 
 ## Blue/Green & Canary releases
 
@@ -402,7 +431,6 @@ function canaryA(req, res){
 }
 ```
 
----
 
 ## Service discovery with `SVCB`/`HTTPS`
 
@@ -424,13 +452,11 @@ res.answers.push({
 });
 ```
 
----
 
 ## Regional failover with SOA/NS health
 
 Synthesize answers depending on upstream health checks; switch NS/A sets when a region is down. Pair with short TTLs and RRSIG validity windows.
 
----
 
 # 📜 Supported Record Types (spec‑aligned)
 
@@ -448,7 +474,6 @@ General RR structure in this library:
 
 The following record types are supported. Each example shows the `data` object expected during `encodeMessage` (and returned during `decodeMessage`).
 
----
 
 ## Address
 
@@ -462,7 +487,6 @@ The following record types are supported. Each example shows the `data` object e
 { data: { address: Uint8Array(16) } }
 ```
 
----
 
 ## Name-based
 
@@ -476,7 +500,6 @@ The following record types are supported. Each example shows the `data` object e
 { data: { name: 'old-target.example.' } }
 ```
 
----
 
 ## Core / Basics
 
@@ -606,7 +629,6 @@ sa: '004' } }
 { data: { raw: Uint8Array([ ... ]) } }
 ```
 
----
 
 ## SRV / NAPTR / URI
 
@@ -647,7 +669,6 @@ sa: '004' } }
 }
 ```
 
----
 
 ## EDNS(0)
 
@@ -668,7 +689,6 @@ sa: '004' } }
 }
 ```
 
----
 
 ## Modern service mapping
 
@@ -691,7 +711,6 @@ sa: '004' } }
 }
 ```
 
----
 
 ## DNSSEC & Security
 
@@ -836,7 +855,6 @@ sa: '004' } }
 }
 ```
 
----
 
 ## Location / Topology / Misc
 
@@ -948,7 +966,6 @@ address: Uint8Array([192,0,2]) } ] } }
 }
 ```
 
----
 
 ## Transfer / Meta
 
@@ -991,7 +1008,6 @@ address: Uint8Array([192,0,2]) } ] } }
 }
 ```
 
----
 
 ## Raw passthrough
 
@@ -1000,14 +1016,6 @@ Types preserved as raw (round-trip only): `EID`, `NIMLOC`, `ATMA`, `SINK`, `NINF
 { data: { raw: Uint8Array([ ... ]) } }
 ```
 
----
-
-# EDNS(0) & ECS
-
-- **EDNS(0)** (RFC 6891) is parsed/emitted. `req.flag_do` reflects the DO bit; `req.edns_udp_size` is the client’s advertised payload size.
-- **ECS** (RFC 7871) — if resolvers send EDNS Client Subnet, you’ll see `req.ecsAddress` and `req.ecsSourcePrefixLength`. Prefer these for Geo‑LB decisions.
-
----
 
 # Performance Notes
 
@@ -1015,7 +1023,6 @@ Types preserved as raw (round-trip only): `EID`, `NIMLOC`, `ATMA`, `SINK`, `NINF
 - Consider a **small signature validity window** for DNSSEC on highly dynamic zones.
 - If you accept high QPS, consider sharding instances per region and delegating via NS.
 
----
 
 # 🗺️ Roadmap
 
@@ -1048,11 +1055,9 @@ The core API is stable, but several enhancements are planned to make **dnssec-se
   - Integration with container orchestrators (Kubernetes service discovery).
   - DoH/DoQ benchmarking & performance tuning.
 
----
 
 💡 *Want something added? Open a [discussion](https://github.com/colocohen/dnssec-server/discussions) or file an issue with the tag `roadmap`. Contributions and proposals are welcome!*
 
----
 
 # Troubleshooting FAQ
 
@@ -1065,7 +1070,6 @@ A: Many resolvers don’t send ECS. Fall back to `req.remoteAddress` or use anyc
 **Q: How do I serve both IPv4 and IPv6?**\
 A: Push parallel `A` and `AAAA` answers.
 
----
 
 # Support the Project
 
@@ -1078,7 +1082,6 @@ If this library saves you time, consider supporting:
 
 > For commercial support or consulting, please open an issue titled **[support]** and we’ll coordinate privately.
 
----
 
 # License
 
@@ -1100,7 +1103,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
----
 
 # References
 

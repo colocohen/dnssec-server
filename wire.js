@@ -249,6 +249,100 @@ function decText(bytes, a, b){ return __td.decode(bytes.slice(a, b)); }
 // DataView helper
 function dvFrom(u8){ return new DataView(u8.buffer, u8.byteOffset, u8.byteLength); }
 
+// helpers
+function ipv6ToBytes(str) {
+  if (typeof str !== 'string') throw new Error('AAAA: address must be string or bytes');
+  // התעלמות מאזורים כמו %eth0 אם קיימים
+  var zone = str.indexOf('%');
+  if (zone !== -1) str = str.slice(0, zone).trim();
+
+  // בדיקת IPv4-ממופה בסוף (::ffff:192.0.2.128)
+  var ipv4 = null;
+  var lastColon = str.lastIndexOf(':');
+  if (str.indexOf('.') !== -1) {
+    ipv4 = str.slice(lastColon + 1);
+    str = str.slice(0, lastColon);
+  }
+
+  var parts = str.split('::');
+  if (parts.length > 2) throw new Error('AAAA: invalid IPv6 (multiple ::)');
+
+  var head = parts[0] ? parts[0].split(':').filter(Boolean) : [];
+  var tail = parts[1] ? parts[1].split(':').filter(Boolean) : [];
+
+  // המרה להקסות (עד 8 הקסטים בסה"כ; IPv4 ממופה תופס 2 הקסטים)
+  var hextets = [];
+
+  function pushHextets(arr) {
+    for (var i = 0; i < arr.length; i++) {
+      var h = arr[i];
+      if (!h.length || h.length > 4 || !/^[0-9a-fA-F]{1,4}$/.test(h)) throw new Error('AAAA: invalid hextet "' + h + '"');
+      hextets.push(parseInt(h, 16));
+    }
+  }
+
+  pushHextets(head);
+
+  var need = 8 - hextets.length - (parts.length === 2 ? tail.length : 0) - (ipv4 ? 2 : 0);
+  if (parts.length === 2) {
+    for (var z = 0; z < need; z++) hextets.push(0);
+    pushHextets(tail);
+  } else {
+    if (ipv4 && hextets.length !== 6) throw new Error('AAAA: invalid IPv6 (IPv4 mapped must leave 6 hextets before)');
+    if (!ipv4 && hextets.length !== 8) throw new Error('AAAA: invalid IPv6 (expected 8 hextets)');
+  }
+
+  if (ipv4) {
+    var oct = ipv4.split('.');
+    if (oct.length !== 4) throw new Error('AAAA: invalid IPv4 tail');
+    for (var j = 0; j < 4; j++) {
+      var n = +oct[j];
+      if (!(n >= 0 && n <= 255) || !/^\d{1,3}$/.test(oct[j])) throw new Error('AAAA: bad IPv4 octet');
+      // שני ההקסות האחרונים מה־IPv4: כל שני בייטים = הקסט אחד
+      if (j % 2 === 0) hextets.push((n << 8) | (+oct[j + 1]));
+    }
+  }
+
+  if (hextets.length !== 8) throw new Error('AAAA: normalization failed');
+
+  var out = new Uint8Array(16);
+  for (var k = 0; k < 8; k++) {
+    out[(k << 1)] = (hextets[k] >> 8) & 0xff;
+    out[(k << 1) + 1] = hextets[k] & 0xff;
+  }
+  return out;
+}
+
+function bytesToIpv6(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length !== 16) throw new Error('AAAA: need 16 bytes');
+  var hextets = new Array(8);
+  for (var i = 0; i < 8; i++) {
+    hextets[i] = ((bytes[i*2] << 8) | bytes[i*2+1]).toString(16);
+  }
+  // דחיסת רצף האפסים הארוך ביותר
+  var bestStart = -1, bestLen = 0, curStart = -1, curLen = 0;
+  for (var h = 0; h < 8; h++) {
+    if (hextets[h] === '0') {
+      if (curStart === -1) { curStart = h; curLen = 1; } else curLen++;
+      if (curLen > bestLen) { bestLen = curLen; bestStart = curStart; }
+    } else {
+      curStart = -1; curLen = 0;
+    }
+  }
+  if (bestLen > 1) {
+    var rep = [''];
+    rep = hextets.slice(0, bestStart).concat(['']).concat(hextets.slice(bestStart + bestLen));
+    // טיפול בקצוות
+    var s = rep.join(':');
+    if (s.startsWith(':')) s = ':' + s;
+    if (s.endsWith(':')) s = s + ':';
+    return s.replace(':::', '::');
+  }
+  return hextets.join(':');
+}
+
+
+
 // encodeName (non-compressed; מתאים ל-RDATA ול-Question כשלא רוצים דחיסה)
 function encodeName(out, off, name/*, _dictIgnored */){
   name = String(name || '.');
@@ -312,8 +406,16 @@ function makeNameRdataDecoder(){
 }
 function makeNameRdataEncoder(field){
   return function(v){
-    var tmp = new Uint8Array(512), off=0;
-    off = encodeName(tmp, off, v[field] || v.name || '.', {});
+    var s;
+    if (typeof v === 'string') {
+      s = v;
+    } else if (v && typeof v === 'object') {
+      s = v[field] || v.name;
+    }
+    if (!s) s = '.';
+
+    var tmp = new Uint8Array(512), off = 0;
+    off = encodeName(tmp, off, s /*, {} */);
     return tmp.slice(0, off);
   };
 }
@@ -331,14 +433,25 @@ types.A.encode = function(v){
 };
 
 // AAAA
-types.AAAA.decode = function(buf, off, rdlen){
-  if (rdlen!==16) throw new Error('AAAA: bad rdlen');
-  return { value:{ address: buf.slice(off, off+16) }, bytes: 16 };
+types.AAAA.decode = function (buf, off, rdlen) {
+  if (rdlen !== 16) throw new Error('AAAA: bad rdlen');
+  var slice = buf.subarray ? buf.subarray(off, off + 16) : buf.slice(off, off + 16);
+  return { value: { address: bytesToIpv6(slice) }, bytes: 16 };
 };
-types.AAAA.encode = function(v){
-  var a = v.address instanceof Uint8Array ? v.address : new Uint8Array(16);
-  if (a.length!==16) throw new Error('AAAA: need 16 bytes');
-  var out = new Uint8Array(16); out.set(a.slice(0,16)); return out;
+
+types.AAAA.encode = function (v) {
+  var a = v && v.address;
+  if (typeof a === 'string') {
+    a = ipv6ToBytes(a);
+  } else if (a instanceof Uint8Array || (a && a.buffer && typeof a.byteLength === 'number')) {
+    a = new Uint8Array(a.buffer, a.byteOffset || 0, a.byteLength || a.length);
+  } else {
+    throw new Error('AAAA: address must be string or 16-byte array');
+  }
+  if (a.length !== 16) throw new Error('AAAA: need 16 bytes');
+  var out = new Uint8Array(16);
+  out.set(a);
+  return out;
 };
 
 // === NAME-based (obsolete/simple): MD, MF, MB, MG, MR, NSAP_PTR, MAILA, MAILB ===

@@ -85,25 +85,36 @@ function fqdn(name){
 function familyOf(address){ return address && address.indexOf(':')!==-1 ? 'IPv6' : 'IPv4'; }
 
 // המרה של ECS bytes לכתובת טקסטואלית
-function ecsBytesToIP(family, bytes){
-  if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes||[]);
-  if (family === 1) { // IPv4
-    var a = Array.from(bytes);
-    while (a.length < 4) a.push(0);
-    return a.slice(0,4).join('.');
+function ecsBytesToIP(family, bytes, prefixLen){
+  var b = (bytes instanceof Uint8Array) ? Array.from(bytes) : Array.from(bytes || []);
+  prefixLen = (prefixLen|0) > 0 ? (prefixLen|0) : (b.length * 8);
+
+  var need = Math.ceil(prefixLen / 8);
+  while (b.length < need) b.push(0);
+
+  if (prefixLen % 8 !== 0) {
+    var bits = prefixLen % 8;
+    var mask = (0xFF << (8 - bits)) & 0xFF;
+    b[need - 1] = b[need - 1] & mask;
   }
+
+  if (family === 1) { // IPv4
+    while (b.length < 4) b.push(0);
+    return b.slice(0,4).join('.');
+  }
+
   if (family === 2) { // IPv6
-    // קיבוץ לזוגות hex
+    while (b.length < 16) b.push(0);
     var parts = [];
     for (var i=0;i<16;i+=2){
-      var hi = bytes[i]   || 0;
-      var lo = bytes[i+1] || 0;
-      parts.push(((hi<<8)|lo).toString(16));
+      var part = ((b[i] << 8) | b[i+1]) & 0xFFFF;
+      parts.push(part.toString(16));
     }
-    // דחיסה בסיסית של רצפים של אפסים (לא מושלם, אבל מספיק ללוגים/ניתוב)
+    // קיצור בסיסי של רצפי אפסים
     var s = parts.join(':').replace(/(^|:)0(:0)+(:|$)/, '::');
     return s;
   }
+
   return undefined;
 }
 
@@ -116,9 +127,9 @@ function buildReq(transport, peer, buf, msg, tlsInfo){
   var type = q ? q.type : undefined;
   var klass = q ? q.class : undefined;
 
-  var ed = msg && msg.edns ? sanitizeEdns(msg.edns) : undefined;
-  var ecs = ed && ed.ecs ? ed.ecs : undefined;
-  var ecsIpStr = ecs ? ecsBytesToIP(ecs.family, ecs.addressBytes) : undefined;
+  var ed  = msg && msg.edns ? sanitizeEdns(msg.edns) : undefined;
+  var ecs = ed && (ed.ecs || (ed.optionsStructured && ed.optionsStructured.ecs)) || undefined;
+  var ecsIpStr = ecs ? ecsBytesToIP(ecs.family, ecs.addressBytes, ecs.sourcePrefixLength) : undefined;
 
   var req = {
     id: msg && msg.header ? (msg.header.id>>>0) : 0,
@@ -141,7 +152,7 @@ function buildReq(transport, peer, buf, msg, tlsInfo){
 
     // ECS (אם קיים) – נגיש בקלות לטובת ניתוב/איזון עומסים
     ecs: ecs || undefined,
-    ecsAddress: ecsIpStr,                      // כתובת כטקסט
+    ecsAddress: ecsIpStr || undefined,
     ecsSourcePrefixLength: ecs ? ecs.sourcePrefixLength : undefined,
     ecsScopePrefixLength:  ecs ? ecs.scopePrefixLength  : undefined,
 
@@ -153,7 +164,6 @@ function buildReq(transport, peer, buf, msg, tlsInfo){
 }
 
 function sanitizeEdns(ed){
-  // מצפה לשדות: { udpSize, extRcode, version, do, z, options, optionsStructured? }
   var out = {
     udpSize: clamp(ed.udpSize || 1232, 512, 4096),
     extRcode: ed.extRcode|0,
@@ -162,12 +172,17 @@ function sanitizeEdns(ed){
     z: ed.z|0,
     options: Array.isArray(ed.options)? ed.options.slice(0) : []
   };
-  // אם יש שדות מפורקים אצלך (cookie/ecs/ede וכד'), אפשר להעתיק:
-  if (ed.optionsStructured) out.optionsStructured = ed.optionsStructured; // אופציונלי
+
+  var os = ed.optionsStructured || {};
+  out.optionsStructured = os;
+
+  // הרמות משדות מפורקים
   if (ed.cookie) out.cookie = ed.cookie;
   if (ed.ecs) out.ecs = ed.ecs;
+  if (!out.ecs && os.ecs) out.ecs = os.ecs; // <-- חשוב
   if (ed.keyTag) out.keyTag = ed.keyTag.slice(0);
   if (ed.ede) out.ede = ed.ede.slice(0);
+
   return out;
 }
 
@@ -343,70 +358,74 @@ function sendResponse(ctx, req, res){
 
   //console.log(ctx.options);
 
-  if(rrsig_exist==false && req.flag_do && req.flag_do==true && ctx && ctx.options && ctx.options.dnssec && typeof ctx.options.dnssec.keyCallback=='function'){
+  if(rrsig_exist==false && res.answers.length>0 && req.flag_do && req.flag_do==true && ctx && ctx.options && ctx.options.dnssec && typeof ctx.options.dnssec.keyCallback=='function'){
 
     ctx.options.dnssec.keyCallback(req.name,function(error,result){
 
-      try{
-        var rrset_bytes=wire.buildRRsetBytesFromAnswers(res.answers);
+      if(result){
+        try{
+          var rrset_bytes=wire.buildRRsetBytesFromAnswers(res.answers);
 
-        var labels=String(res.answers[0].name).replace(/\.$/, '').split('.').length;
+          var labels=String(res.answers[0].name).replace(/\.$/, '').split('.').length;
 
-        var the_key=null;
-        if(res.answers[0].type=='DNSKEY'){
-          the_key=result.ksk;
-        }else{
-          the_key=result.zsk;
-        }
-
-        var timestamp_now = Math.floor(Date.now() / 1000);
-
-        if('inception' in the_key==false || the_key.inception<=0 || typeof the_key.inception!=='number'){
-          the_key.inception=timestamp_now - 300;
-        }
-
-        if('expiration' in the_key==false || the_key.expiration<=0 || typeof the_key.expiration!=='number'){
-          the_key.expiration=timestamp_now + (346 * 24 * 3600);
-        }
-
-        var sig_data=signRRset(result.signersName,rrset_bytes,13,the_key.keyTag,the_key.expiration,the_key.inception,the_key.privateKey,labels,res.answers[0].type,res.answers[0].ttl);
-
-        var rrsig_record = {
-          name: res.answers[0].name,
-          type: 'RRSIG',
-          class: res.answers[0].class,
-          ttl: res.answers[0].ttl,
-          data: {
-            typeCovered: wire.type_to_code[res.answers[0].type.toUpperCase()] || 0,
-            algorithm: 13,
-            labels: labels,
-            originalTTL: res.answers[0].ttl,
-            expiration: the_key.expiration,
-            inception: the_key.inception,
-            keyTag: Number(the_key.keyTag),
-            signersName: result.signersName,
-            signature: sig_data,
+          var the_key=null;
+          if(res.answers[0].type=='DNSKEY'){
+            the_key=result.ksk;
+          }else{
+            the_key=result.zsk;
           }
-        };
 
-        res.answers.push(rrsig_record);
+          var timestamp_now = Math.floor(Date.now() / 1000);
 
-        res.additionals.push({
-          type: 'OPT',
-          name: '.',
-          edns: {
-            udpSize: 4096,
-            extRcode: 0,
-            version: 0,
-            do: true,
-            options: []
+          if('inception' in the_key==false || the_key.inception<=0 || typeof the_key.inception!=='number'){
+            the_key.inception=timestamp_now - 300;
           }
-        });
 
+          if('expiration' in the_key==false || the_key.expiration<=0 || typeof the_key.expiration!=='number'){
+            the_key.expiration=timestamp_now + (346 * 24 * 3600);
+          }
+
+          var sig_data=signRRset(result.signersName,rrset_bytes,13,the_key.keyTag,the_key.expiration,the_key.inception,the_key.privateKey,labels,res.answers[0].type,res.answers[0].ttl);
+
+          var rrsig_record = {
+            name: res.answers[0].name,
+            type: 'RRSIG',
+            class: res.answers[0].class,
+            ttl: res.answers[0].ttl,
+            data: {
+              typeCovered: wire.type_to_code[res.answers[0].type.toUpperCase()] || 0,
+              algorithm: 13,
+              labels: labels,
+              originalTTL: res.answers[0].ttl,
+              expiration: the_key.expiration,
+              inception: the_key.inception,
+              keyTag: Number(the_key.keyTag),
+              signersName: result.signersName,
+              signature: sig_data,
+            }
+          };
+
+          res.answers.push(rrsig_record);
+
+          res.additionals.push({
+            type: 'OPT',
+            name: '.',
+            edns: {
+              udpSize: 4096,
+              extRcode: 0,
+              version: 0,
+              do: true,
+              options: []
+            }
+          });
+
+          actual_send();
+
+        }catch(e2){
+          console.log(e2);
+        }
+      }else{
         actual_send();
-
-      }catch(e2){
-        console.log(e2);
       }
 
     });
@@ -418,7 +437,7 @@ function sendResponse(ctx, req, res){
 }
 
 
-function autoAnswerIfApplicable(req, res, ctx){
+function autoAnswerIfApplicable(req, res, ctx, callback){
   try{
 
     if(req.type === 'TLSA'){
@@ -467,12 +486,14 @@ function autoAnswerIfApplicable(req, res, ctx){
           }
           
           res.send();
+
+          callback(true);
+        }else{
+          callback(false);
         }
         
 
       });
-      
-      
 
     }else if(req.type === 'DS'){
 
@@ -489,6 +510,10 @@ function autoAnswerIfApplicable(req, res, ctx){
         }
       });
 
+      callback(false);
+
+    }else{
+      callback(false);
     }
 
     if (ctx && ctx.options && ctx.options.tls && typeof ctx.tls.SNICallback=='function') {
@@ -499,9 +524,9 @@ function autoAnswerIfApplicable(req, res, ctx){
 
     }
 
-    return false;
+
   }catch(e){
-    return false;
+    callback(false);
   }
 }
 
@@ -531,7 +556,7 @@ function createServer(options, handler){
     udpOpt = { udp4:{ host:uhost, port:uport }, udp6:{ host:'::', port:uport } };
   }
 
-  var tcpOpt = options.tcp===false ? null : (options.tcp || { host:'0.0.0.0', port:53, idleMs:30000 });
+  var tcpOpt = options.tcp===false ? null : (options.tcp || { host:'::', port:53, idleMs:30000 });
   var tlsOpt = options.tls || null;
   var quicOpt = options.quic || null;
 
@@ -603,12 +628,12 @@ function createServer(options, handler){
     var res = buildRes(req, serverCtx);
 
 
-    if (autoAnswerIfApplicable(req, res, serverCtx) === true) {
-      // autoAnswerIfApplicable כבר שלח תשובה
-      return;
-    }
-
-    return handler(req, res);
+    autoAnswerIfApplicable(req, res, serverCtx,function(is_sent){
+      if(is_sent==false){
+        return handler(req, res);
+      }
+    });
+    
   }
 
   // --- UDP4 ---
@@ -635,7 +660,7 @@ function createServer(options, handler){
 
   // --- UDP6 ---
   if (udpOpt && udpOpt.udp6){
-    var u6 = dgram.createSocket('udp6');
+    var u6 = dgram.createSocket({type: 'udp6', ipv6Only: true});
     u6.on('message', function(buf, rinfo){
       try {
         var u8 = toU8(buf);
@@ -676,7 +701,7 @@ function createServer(options, handler){
       if (tcpOpt.idleMs>0){ socket.setTimeout(tcpOpt.idleMs, function(){ socket.destroy(); }); }
       socket.on('error', function(err){});
     });
-    tcp.listen((tcpOpt.port|0)||53, tcpOpt.host||'0.0.0.0');
+    tcp.listen((tcpOpt.port|0)||53, tcpOpt.host||'::');
     serverCtx.tcp = tcp;
   }
 
@@ -707,7 +732,7 @@ function createServer(options, handler){
       if (tlsOpt.idleMs>0){ socket.setTimeout(tlsOpt.idleMs, function(){ socket.destroy(); }); }
       socket.on('error', function(err){});
     });
-    tlsSrv.listen((tlsOpt.port|0) || 853, tlsOpt.host||'0.0.0.0');
+    tlsSrv.listen((tlsOpt.port|0) || 853, tlsOpt.host||'::');
     serverCtx.tls = tlsSrv;
   }
 
