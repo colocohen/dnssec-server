@@ -342,7 +342,7 @@ dig +dnssec example.com DNSKEY
 dig +dnssec example.com A
 ```
 
-Or use [dnssec-debugger.verisignlabs.com](https://dnssec-debugger.verisignlabs.com/ojos.tv) to confirm everything validates.
+Or use [dnssec-debugger.verisignlabs.com](https://dnssec-debugger.verisignlabs.com) to confirm everything validates.
 
 
 # 📦 Migrating from Zone Files
