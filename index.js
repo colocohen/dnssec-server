@@ -23,5 +23,7 @@ module.exports = {
   createServer: server.createServer,
   buildDnssecMaterial: server.buildDnssecMaterial,
   encodeMessage: wire.encodeMessage,
-  decodeMessage: wire.decodeMessage
+  decodeMessage: wire.decodeMessage,
+  parseZone: wire.parseZone,
+  answerFromZone: server.answerFromZone
 };

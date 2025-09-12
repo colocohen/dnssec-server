@@ -1763,6 +1763,325 @@ function buildRRsetBytesFromAnswers(answers){
   return out;
 }
 
+
+
+
+/*
+ * Zone file parser & compiler for dnssec-server (Node.js)
+ * ---------------------------------------------------------------
+ * DESIGN
+ *  - parseZone: PURE compiler → returns compact data only (no methods)
+ *    { origin, default_ttl, records }
+ *    • records: unique RR array in wire shape { name, type, class, ttl, data }
+ *    • No duplicates; no byName map; no helper methods on the zone object
+ *  - answerFromZone: Pure resolver over `zone.records`
+ *    (exact, ANY, wildcard per RFC 4592, NODATA/NXDOMAIN, glue, SVCB/HTTPS hints)
+ */
+
+function parseZone(zoneText, opts){
+  opts = opts || {};
+
+  function isDigit(c){ return c >= '0' && c <= '9'; }
+  function toU32(x){ var n = parseInt(x, 10); if (isNaN(n) || n < 0) return null; return n >>> 0; }
+
+  function parseTTL(ttlStr){
+    if (!ttlStr) return null;
+    if (/^\d+$/.test(ttlStr)) return toU32(ttlStr);
+    var m = ttlStr.match(/^(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i);
+    if (!m) return null;
+    var w = m[1]?parseInt(m[1],10):0;
+    var d = m[2]?parseInt(m[2],10):0;
+    var h = m[3]?parseInt(m[3],10):0;
+    var mi= m[4]?parseInt(m[4],10):0;
+    var s = m[5]?parseInt(m[5],10):0;
+    var total = (((w*7+d)*24+h)*60+mi)*60+s;
+    return total>>>0;
+  }
+
+  function b64ToBytes(str){
+    try {
+      if (typeof Buffer!=='undefined') {
+        return new Uint8Array(
+          Buffer.from(String(str).replace(/\s+/g,'').replace(/-/g,'+').replace(/_/g,'/'),'base64')
+        );
+      }
+    } catch(e){}
+    return new Uint8Array([]);
+  }
+  function hexToBytes(str){
+    var s = String(str).replace(/\s+/g,'');
+    if (s.length % 2 !== 0) return new Uint8Array([]);
+    var out = new Uint8Array(s.length/2);
+    for (var i=0;i<out.length;i++) out[i] = parseInt(s.substr(i*2,2),16)>>>0;
+    return out;
+  }
+  function textTokensToBytes(tokens){
+    var joined = tokens.join('');
+    if (/^[0-9A-Fa-f]+$/.test(joined) && joined.length%2===0) return hexToBytes(joined);
+    return b64ToBytes(joined);
+  }
+
+  function ensureDot(n){ if (!n) return '.'; return n[n.length-1]==='.'?n:n+'.'; }
+  function ensureNoDot(n){ if (!n) return ''; return n[n.length-1]==='.'?n.slice(0,-1):n; }
+  function absName(name, origin){
+    if (name==='@') return ensureDot(origin);
+    if (name==='.') return '.';
+    if (!name) return null;
+    if (name[name.length-1]==='.') return name;
+    if (!origin) return name+'.';
+    return name+'.'+ensureNoDot(origin)+'.';
+  }
+  function unescapeText(s){
+    var out='';
+    for (var i=0;i<s.length;i++){
+      var c=s[i];
+      if (c==='\\'){
+        var j=i+1;
+        if (j+2<s.length && isDigit(s[j])&&isDigit(s[j+1])&&isDigit(s[j+2])){
+          var oct=s.substr(j,3);
+          var code=parseInt(oct,8)&0xFF;
+          out+=String.fromCharCode(code);i+=3;continue;
+        }
+        if (j<s.length){out+=s[j];i++;continue;}
+      }
+      out+=c;
+    }
+    return out;
+  }
+
+  function splitLogicalLines(txt){
+    var lines=txt.split(/\r?\n/);
+    var out=[];var cur='';var depth=0;
+    for (var li=0;li<lines.length;li++){
+      var line=lines[li];
+      var q=false;var esc=false;var cleaned='';
+      for (var k=0;k<line.length;k++){
+        var ch=line[k];
+        if (!q && ch===';') break;
+        if (ch==='"'&&!esc) q=!q;
+        if (ch==='('&&!q) depth++;
+        if (ch===')'&&!q&&depth>0) depth--;
+        cleaned+=ch;
+        esc=(ch==='\\'&&!esc);
+      }
+      cur+=(cleaned+' ');
+      if (depth===0){
+        var trimmed=cur.replace(/\s+/g,' ').trim();
+        if (trimmed.length>0) out.push(trimmed);
+        cur='';
+      }
+    }
+    if (cur.trim().length>0) out.push(cur.trim());
+    return out;
+  }
+
+  function tokenize(s){
+    var toks=[];var buf='';var q=false;var esc=false;
+    for (var i=0;i<s.length;i++){
+      var ch=s[i];
+      if (q){
+        if (esc){buf+=ch;esc=false;continue;}
+        if (ch==='\\'){esc=true;continue;}
+        if (ch==='"'){q=false;toks.push(buf);buf='';continue;}
+        buf+=ch;continue;
+      } else {
+        if (ch==='"'){if (buf.length){toks.push(buf);buf='';}q=true;continue;}
+        if (/\s/.test(ch)){if (buf.length){toks.push(buf);buf='';}continue;}
+        buf+=ch;
+      }
+    }
+    if (buf.length) toks.push(buf);
+    return toks;
+  }
+
+  function stableStringify(obj){
+    if (obj===null || typeof obj!=='object') return String(obj);
+    if (Array.isArray(obj)) return '['+obj.map(stableStringify).join(',')+']';
+    var keys=Object.keys(obj).sort();
+    var parts=[]; for (var i=0;i<keys.length;i++){ var k=keys[i]; parts.push(k+':'+stableStringify(obj[k])); }
+    return '{'+parts.join(',')+'}';
+  }
+  function rrKey(rr){
+    return rr.name+'|'+rr.type+'|'+rr.class+'|'+(rr.ttl>>>0)+'|'+stableStringify(rr.data);
+  }
+
+  function parseRR(tokens, state){
+    var idx=0;var owner=null,ttl=null,rrclass='IN',type=null;
+    if (tokens[0]&&tokens[0][0]==='$'){
+      var d=tokens[0].toUpperCase();
+      if (d==='$ORIGIN'){ if (tokens.length<2) return null; state.origin=ensureDot(tokens[1]); return null; }
+      if (d==='$TTL'){ if (tokens.length<2) return null; state.default_ttl=parseTTL(tokens[1]); return null; }
+      if (d==='$INCLUDE'){ return null; }
+      return null;
+    }
+    if (idx<tokens.length){
+      var t0=tokens[idx];
+      var maybeType=t0.toUpperCase();
+      var maybeTTL=parseTTL(t0);
+      var isClass=class_to_code.hasOwnProperty(maybeType);
+      var isType=type_to_code.hasOwnProperty(maybeType);
+      if(!isType&&!isClass&&maybeTTL===null){owner=t0;idx++;}
+    }
+    if (idx<tokens.length){ var ttl1=parseTTL(tokens[idx]); if (ttl1!==null){ttl=ttl1;idx++;} }
+    if (idx<tokens.length){ var c=tokens[idx].toUpperCase(); if (class_to_code[c]){rrclass=c;idx++;} }
+    if (idx>=tokens.length) return null;
+    type=tokens[idx].toUpperCase();idx++;
+    if (!type_to_code[type]) return null;
+    if (owner===null) owner=state.last_owner||'@';
+    var fqdn=absName(owner,state.origin);
+    if (ttl===null) ttl=state.default_ttl!=null?state.default_ttl:3600;
+    var rdtoks=tokens.slice(idx);
+
+    var rr={ name:fqdn, type:type, class:rrclass, ttl:ttl>>>0, data:null };
+
+    function nameArg(i){ return absName(rdtoks[i], state.origin); }
+    function intArg(i){ return toU32(rdtoks[i]); }
+
+    switch(type){
+      case 'SOA':{
+        var toks=[];for(var si=0;si<rdtoks.length;si++){if(rdtoks[si]==='('||rdtoks[si]===')')continue;toks.push(rdtoks[si]);}
+        rr.data={ mname:absName(toks[0],state.origin), rname:absName(toks[1],state.origin), serial:parseInt(toks[2],10)>>>0, refresh:parseTTL(toks[3])||toU32(toks[3]), retry:parseTTL(toks[4])||toU32(toks[4]), expire:parseTTL(toks[5])||toU32(toks[5]), minimum:parseTTL(toks[6])||toU32(toks[6]) };
+        break;
+      }
+      case 'A': rr.data={ address: rdtoks[0] }; break;
+      case 'AAAA': rr.data={ address: ipv6ToBytes(rdtoks[0]) }; break;
+      case 'NS': rr.data={ name: nameArg(0) }; break;
+      case 'CNAME': rr.data={ name: nameArg(0) }; break;
+      case 'PTR': rr.data={ name: nameArg(0) }; break;
+      case 'DNAME': rr.data={ name: nameArg(0) }; break;
+      case 'MX': rr.data={ preference:intArg(0), exchange:nameArg(1) }; break;
+      case 'TXT': rr.data={ texts: rdtoks.map(unescapeText) }; break;
+      case 'HINFO': rr.data={ cpu: rdtoks[0], os: rdtoks[1] }; break;
+      case 'MINFO': rr.data={ rmailbx: nameArg(0), emailbx: nameArg(1) }; break;
+      case 'RP': rr.data={ mbox: nameArg(0), txt: nameArg(1) }; break;
+      case 'AFSDB': rr.data={ subtype: intArg(0), hostname: nameArg(1) }; break;
+      case 'X25': rr.data={ address: rdtoks[0] }; break;
+      case 'ISDN': rr.data={ address: rdtoks[0], sa: rdtoks[1]||undefined }; break;
+      case 'RT': rr.data={ preference: intArg(0), host: nameArg(1) }; break;
+      case 'NSAP': rr.data={ address: hexToBytes(rdtoks[0]) }; break;
+      case 'PX': rr.data={ preference: intArg(0), MAP822: nameArg(1), MAPX400: nameArg(2) }; break;
+      case 'GPOS': rr.data={ latitude: rdtoks[0], longitude: rdtoks[1], altitude: rdtoks[2] }; break;
+      case 'WKS': rr.data={ address: rdtoks[0], protocol: intArg(1), bitmap: textTokensToBytes(rdtoks.slice(2)) }; break;
+      case 'NULL': rr.data={ raw: textTokensToBytes(rdtoks) }; break;
+
+      case 'SRV': rr.data={ priority:intArg(0), weight:intArg(1), port:intArg(2), target:nameArg(3) }; break;
+      case 'NAPTR': rr.data={ order:intArg(0), preference:intArg(1), flags:rdtoks[2], services:rdtoks[3], regexp:rdtoks[4], replacement:nameArg(5) }; break;
+      case 'URI': rr.data={ priority: intArg(0), weight: intArg(1), target: unescapeText(rdtoks.slice(2).join(' ')) }; break;
+
+      case 'DNSKEY':
+      case 'CDNSKEY':
+        rr.data={ flags:intArg(0), protocol:intArg(1), algorithm:intArg(2), key:b64ToBytes(rdtoks.slice(3).join('')) };
+        break;
+      case 'KEY':
+        rr.data={ flags:intArg(0), protocol:intArg(1), algorithm:intArg(2), key:b64ToBytes(rdtoks.slice(3).join('')) };
+        break;
+      case 'DS':
+      case 'CDS':
+      case 'DLV':
+      case 'TA':
+        rr.data={ keyTag:intArg(0), algorithm:intArg(1), digestType:intArg(2), digest:hexToBytes(rdtoks.slice(3).join('')) };
+        break;
+      case 'RRSIG':
+      case 'SIG':{
+        var typeCovered = rdtoks[0];
+        var algorithm = intArg(1);
+        var labels = intArg(2);
+        var originalTTL = intArg(3);
+        var expiration = toU32(rdtoks[4]);
+        var inception  = toU32(rdtoks[5]);
+        var keyTag = intArg(6);
+        var signersName = absName(rdtoks[7], state.origin);
+        var signature = b64ToBytes(rdtoks.slice(8).join(''));
+        rr.data = { typeCovered, algorithm, labels, originalTTL, expiration, inception, keyTag, signersName, signature };
+        break;
+      }
+      case 'NSEC': rr.data={ nextDomainName:nameArg(0), types:rdtoks.slice(1).map(function(x){return String(x).toUpperCase();}) }; break;
+      case 'NSEC3':{
+        rr.data={ hashAlgorithm:intArg(0), flags:intArg(1), iterations:intArg(2), salt:(rdtoks[3]==='-'? new Uint8Array([]) : hexToBytes(rdtoks[3])), nextHashedOwnerName:b64ToBytes(rdtoks[4]), types:rdtoks.slice(5).map(function(x){return String(x).toUpperCase();}) };
+        break;
+      }
+      case 'NSEC3PARAM': rr.data={ hashAlgorithm:intArg(0), flags:intArg(1), iterations:intArg(2), salt:(rdtoks[3]==='-'? new Uint8Array([]) : hexToBytes(rdtoks[3])) }; break;
+      case 'DHCID': rr.data={ data: b64ToBytes(rdtoks.join('')) }; break;
+      case 'TLSA':
+      case 'SMIMEA': rr.data={ usage:intArg(0), selector:intArg(1), matchingType:intArg(2), certificate: hexToBytes(rdtoks[3]) }; break;
+      case 'CERT': rr.data={ certType:intArg(0), keyTag:intArg(1), algorithm:intArg(2), certificate: b64ToBytes(rdtoks.slice(3).join('')) }; break;
+      case 'SSHFP': rr.data={ algorithm:intArg(0), hash:intArg(1), fingerprint: hexToBytes(rdtoks[2]) }; break;
+      case 'IPSECKEY':{
+        rr.data={ precedence:intArg(0), gatewayType:intArg(1), algorithm:intArg(2), gateway:(rdtoks[3]==='.'?'.':nameArg(3)), publicKey: b64ToBytes(rdtoks.slice(4).join('')) };
+        break;
+      }
+
+      case 'SVCB':
+      case 'HTTPS':{
+        var priority=intArg(0);var target=nameArg(1);
+        var paramsStructured={};
+        for (var pi=2;pi<rdtoks.length;pi++){
+          var p=String(rdtoks[pi]);var eq=p.indexOf('=');var k=(eq>=0?p.slice(0,eq):p).toLowerCase();var v=(eq>=0?p.slice(eq+1):null);
+          if (v&&v[0]==='"'&&v[v.length-1]==='"') v=v.slice(1,-1);
+          if (v==null){ if (k==='no-default-alpn') paramsStructured.noDefaultAlpn = true; else paramsStructured[k]=true; continue; }
+          if (k==='alpn') paramsStructured.alpn=v.split(',');
+          else if (k==='port') paramsStructured.port=parseInt(v,10)>>>0;
+          else if (k==='ipv4hint') paramsStructured.ipv4hint=v.split(',');
+          else if (k==='ipv6hint') paramsStructured.ipv6hint=v.split(',');
+          else if (k==='ech') paramsStructured.ech = b64ToBytes(v);
+          else if (k==='dohpath') paramsStructured.dohpath = v;
+          else if (k==='tls-supported-groups') paramsStructured.tlsSupportedGroups = v.split(',').map(function(x){return parseInt(x,10)>>>0;});
+          else paramsStructured[k]=v;
+        }
+        rr.data={ priority:priority, targetName:target, paramsStructured:paramsStructured };
+        break;
+      }
+
+      case 'HIP': rr.data={ algorithm:intArg(0), hit: b64ToBytes(rdtoks[1]), publicKey: b64ToBytes(rdtoks[2]), servers: rdtoks.slice(3).map(function(x){return absName(x, state.origin);}) }; break;
+      case 'NID': rr.data={ preference:intArg(0), nodeIdHigh: toU32(rdtoks[1]), nodeIdLow: toU32(rdtoks[2]) }; break;
+      case 'L32': rr.data={ preference:intArg(0), locator32: rdtoks[1] }; break;
+      case 'L64': rr.data={ preference:intArg(0), locator64High: toU32(rdtoks[1]), locator64Low: toU32(rdtoks[2]) }; break;
+      case 'LP': rr.data={ preference:intArg(0), fqdn: nameArg(1) }; break;
+      case 'EUI48': rr.data={ address: hexToBytes(rdtoks[0]) }; break;
+      case 'EUI64': rr.data={ address: hexToBytes(rdtoks[0]) }; break;
+      case 'OPENPGPKEY': rr.data={ key: b64ToBytes(rdtoks.join('')) }; break;
+      case 'ZONEMD': rr.data={ scheme:intArg(0), hashAlgorithm:intArg(1), digest: hexToBytes(rdtoks[2]) }; break;
+      case 'TKEY': rr.data={ algorithm: nameArg(0), inception: toU32(rdtoks[1]), expiration: toU32(rdtoks[2]), mode: intArg(3), error:intArg(4), key: b64ToBytes(rdtoks[5]||''), other: b64ToBytes(rdtoks[6]||'') }; break;
+      case 'TSIG': rr.data={ algorithm: nameArg(0), timeSignedHigh: intArg(1), timeSignedLow: intArg(2), fudge:intArg(3), mac: b64ToBytes(rdtoks[4]), originalId: toU32(rdtoks[5]), error:intArg(6), otherData: b64ToBytes(rdtoks[7]||'') }; break;
+
+      case 'LOC':
+      case 'APL':
+      case 'EID':
+      case 'NIMLOC':
+      case 'ATMA':
+      case 'SINK':
+      case 'NINFO':
+      case 'RKEY':
+      case 'TALINK':
+      case 'IXFR':
+      case 'AXFR':
+      case 'ANY':
+        rr.data={ raw: textTokensToBytes(rdtoks) }; break;
+
+      default:
+        rr.data={ raw: textTokensToBytes(rdtoks) }; break;
+    }
+    state.last_owner = owner || state.last_owner;
+    return rr;
+  }
+
+  var state={ origin:ensureDot(opts.origin||''), default_ttl:opts.default_ttl||null, last_owner:null };
+  var logical=splitLogicalLines(zoneText);
+  var zone={ origin:state.origin||'.', default_ttl:state.default_ttl||3600, records:[] };
+
+  var seen = Object.create(null); // key→true for dedup
+
+  for (var i=0;i<logical.length;i++){
+    var rr=parseRR(tokenize(logical[i]),state);
+    if (!rr) continue;
+    var key = rrKey(rr); if (seen[key]) continue; seen[key] = true; // de-dup
+    zone.records.push(rr);
+  }
+
+  return zone;
+}
+
+
 module.exports = {
   encodeMessage: encodeMessage,
   decodeMessage: decodeMessage,
@@ -1772,6 +2091,8 @@ module.exports = {
   makeNameRdataEncoder: makeNameRdataEncoder,
   
   buildRRsetBytesFromAnswers: buildRRsetBytesFromAnswers,
+
+  parseZone: parseZone,
 
   type_to_code,
   rcode_to_code,

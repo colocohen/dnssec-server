@@ -347,10 +347,87 @@ Or use [dnssec-debugger.verisignlabs.com](https://dnssec-debugger.verisignlabs.c
 
 # 📦 Migrating from Zone Files
 
-Many users already have their DNS data in a traditional **zone file** (BIND-style).  
-We plan to provide a simple migration path so you can load an existing zone file directly into this library, without rewriting records manually.  
+If you are already operating an external DNS server (such as **BIND**) and maintaining your zones in standard **zone files**, you don’t need to rewrite your data.  
+`dnssec-server` provides first-class support for BIND-style zone files: you can load them directly, parse them with `parseZone()`, and use `answerFromZone()` to resolve queries.  
 
-**This feature is coming soon (TBD).**
+This approach makes migration seamless:
+- No manual conversion of records.
+- `$ORIGIN` and `$TTL` directives are honored.
+- Broad RR support (A, AAAA, NS, CNAME, MX, TXT, SRV, CAA, NAPTR, DNSKEY, DS, RRSIG, NSEC, NSEC3PARAM).
+- Full support for **SVCB/HTTPS** including `priority`, `target`, `alpn`, `port`, `ipv4hint`, `ipv6hint`, and glue generation.
+
+
+**Supported today**
+- `$ORIGIN` and `$TTL`
+- A, AAAA, NS, CNAME, PTR, MX, TXT, SRV, CAA, NAPTR, DNSKEY, DS, RRSIG, NSEC, NSEC3PARAM
+- **SVCB/HTTPS** with normalized `data`:
+  - `priority`, `target`, `params` (e.g. `alpn`, `port`, `ipv4hint`, `ipv6hint`, unknown keys preserved)
+  - Glue for MX/SRV/NS and SVCB/HTTPS targets (when present in the zone)
+  - A/AAAA synthesized from `ipv4hint`/`ipv6hint` for the **TargetName** are added to `additionals`
+
+> ℹ️ If your zone file doesn’t contain `$ORIGIN`, pass `parseZone(text, { origin: 'example.com.' })`.
+
+
+## Example: load multiple zone files and serve them
+
+```js
+const fs = require('fs');
+const tls = require('tls');
+const DNSServer = require('dnssec-server');
+
+// 1) Load and parse multiple BIND-style zone files (sync for simplicity)
+const zones = {
+  'example.com.': DNSServer.parseZone(fs.readFileSync('example.com.zone', 'utf8')),
+  'example.net.': DNSServer.parseZone(fs.readFileSync('example.net.zone', 'utf8')),
+  // add more apexes as needed...
+};
+
+// 2) Choose the zone by longest-suffix match
+function pickZone(zs, qname) {
+  let bestOrigin = null, bestLen = -1;
+  for (const origin of Object.keys(zs)) {
+    const match = (qname === origin) || qname.endsWith('.' + origin.replace(/\.$/, '') + '.');
+    if (match && origin.length > bestLen) { bestOrigin = origin; bestLen = origin.length; }
+  }
+  return bestOrigin ? zs[bestOrigin] : null;
+}
+
+// 3) Create the server. Map each request to a pure answer object.
+DNSServer.createServer({
+  tls: {
+    SNICallback: (servername, cb) =>
+      cb(null, tls.createSecureContext({
+        key:  fs.readFileSync('key.pem'),
+        cert: fs.readFileSync('cert.pem')
+      }))
+  }
+}, (req, res) => {
+  const zone = pickZone(zones, req.name);
+
+  if(zone){
+    var { rcode, answers, authority, additionals } = DNSServer.answerFromZone(zone, req.name, req.type, req.class);
+  }else{
+    var rcode=3; 
+    var answers=[]; 
+    var authority=[];
+    var additionals=[];
+  }
+
+  // 👇 You have an opportunity to modify the response here (e.g., adjust TTLs,
+  //    inject ECS-based answers, add/remove records, override rcode, etc.)
+
+  res.header.rcode = rcode;          // 0 = NOERROR, 3 = NXDOMAIN
+  res.answers.push(...answers);
+  res.authority.push(...authority);
+  res.additionals.push(...additionals);
+  res.send();
+
+
+}).listen(53, () => {
+  console.log('Authoritative DNS (UDP/TCP) on :53 + DoT on :853');
+});
+```
+
 
 
 # 🔎 Understanding ECS (EDNS Client Subnet)
@@ -1027,11 +1104,6 @@ Types preserved as raw (round-trip only): `EID`, `NIMLOC`, `ATMA`, `SINK`, `NINF
 # 🗺️ Roadmap
 
 The core API is stable, but several enhancements are planned to make **dnssec-server** even more production-ready:
-
-- 📂 **Zone file parser / migration tools**
-  - Parser for standard BIND-style zone files.
-  - Convert static zone files into `dnssec-server` dynamic objects.
-  - Optional exporter back to zone file format for interoperability.
 
 - 🛡️ **DNSSEC optimizations**
   - Response signature caching (avoid re-signing identical RRsets on every query).

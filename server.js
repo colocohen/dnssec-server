@@ -851,7 +851,120 @@ function buildDnssecMaterial(params){
 }
 
 
+
+
+
+
+
+
+
+
+/////////////////
+
+function answerFromZone(zone,qname,qtype,qclass){
+  // Work only with zone.records (compact array) — no byName map.
+  qtype = (qtype||'A').toUpperCase();
+  qclass = (qclass||'IN').toUpperCase();
+
+  function ensureDot(n){ if (!n) return '.'; return n[n.length-1]==='.'?n:n+'.'; }
+  function absName(n){ return (n && n[n.length-1]==='.') ? n : ensureDot(n||''); }
+
+  var fq = absName(qname);
+
+  function existsName(name){
+    for (var i=0;i<zone.records.length;i++){ if (zone.records[i].name === name) return true; }
+    return false;
+  }
+  function collect(name, type){
+    var out=[];
+    for (var i=0;i<zone.records.length;i++){
+      var rr=zone.records[i];
+      if (rr.name===name && (type==='ANY' || rr.type===type)) out.push(rr);
+    }
+    return out;
+  }
+  function collectAllTypes(name){
+    var out=[]; for (var i=0;i<zone.records.length;i++){ var rr=zone.records[i]; if (rr.name===name) out.push(rr); } return out;
+  }
+  function findSOA(){
+    var apex = zone.origin || '.';
+    var best=null;
+    for (var i=0;i<zone.records.length;i++){
+      var rr=zone.records[i];
+      if (rr.type==='SOA' && rr.name===apex) return rr;
+      if (!best && rr.type==='SOA') best = rr;
+    }
+    return best;
+  }
+  function wildcardLookup(name, type){
+    if (name === '.') return [];
+    var labels = name.slice(0,-1).split('.');
+    for (var i=0;i<labels.length-1;i++){
+      var suffix = labels.slice(i+1).join('.') + '.';
+      var cand = '*.' + suffix;
+      var arr = (type==='ANY') ? collectAllTypes(cand) : collect(cand, type);
+      if (arr.length){
+        var mapped=[];
+        for (var j=0;j<arr.length;j++){
+          var r=arr[j]; mapped.push({ name:name, type:r.type, class:r.class, ttl:r.ttl, data:r.data });
+        }
+        return mapped;
+      }
+    }
+    return [];
+  }
+
+  // exact
+  var answers = collect(fq, qtype);
+  if (answers.length){
+    var out = { rcode:0, answers:answers, authority:[], additionals:[], reason:'exact' };
+    addGlue(out.answers, out.additionals);
+    addSvcbHttpsHints(out.answers, out.additionals);
+    return out;
+  }
+  if (existsName(fq)){
+    var soa = findSOA();
+    return { rcode:0, answers:[], authority: soa?[soa]:[], additionals:[], reason:'NODATA' };
+  }
+  // wildcard
+  var wc = wildcardLookup(fq, qtype);
+  if (wc.length){
+    var out2 = { rcode:0, answers:wc, authority:[], additionals:[], reason:'wildcard' };
+    addGlue(out2.answers, out2.additionals);
+    addSvcbHttpsHints(out2.answers, out2.additionals);
+    return out2;
+  }
+  var soa2 = findSOA();
+  return { rcode:3, answers:[], authority: soa2?[soa2]:[], additionals:[], reason:'NXDOMAIN' };
+
+  function addGlue(rrs, out){
+    for (var i=0;i<rrs.length;i++){
+      var rr=rrs[i];
+      var targets=[];
+      if (rr.type==='MX' && rr.data && rr.data.exchange) targets.push(rr.data.exchange);
+      else if (rr.type==='SRV' && rr.data && rr.data.target) targets.push(rr.data.target);
+      else if (rr.type==='NS' && rr.data && rr.data.name) targets.push(rr.data.name);
+      else if ((rr.type==='SVCB'||rr.type==='HTTPS') && rr.data && rr.data.targetName) targets.push(rr.data.targetName);
+      for (var t=0;t<targets.length;t++){
+        var name=targets[t];
+        var a4 = collect(name,'A'); if (a4.length) Array.prototype.push.apply(out, a4);
+        var a6 = collect(name,'AAAA'); if (a6.length) Array.prototype.push.apply(out, a6);
+      }
+    }
+  }
+  function addSvcbHttpsHints(rrs, out){
+    for (var i=0;i<rrs.length;i++){
+      var rr=rrs[i]; if (rr.type!=='SVCB' && rr.type!=='HTTPS') continue;
+      var p = rr.data && rr.data.paramsStructured; var targetName = (rr.data && rr.data.targetName) ? rr.data.targetName : rr.name;
+      if (p && Array.isArray(p.ipv4hint)) for (var h=0; h<p.ipv4hint.length; h++) out.push({ name: targetName, type:'A', class:'IN', ttl: rr.ttl, data:{ address: p.ipv4hint[h] }});
+      if (p && Array.isArray(p.ipv6hint)) for (var h6=0; h<p.ipv6hint.length; h6++) out.push({ name: targetName, type:'AAAA', class:'IN', ttl: rr.ttl, data:{ address: p.ipv6hint[h6] }});
+    }
+  }
+}
+
+
 module.exports = {
   createServer: createServer,
-  buildDnssecMaterial: buildDnssecMaterial
+  buildDnssecMaterial: buildDnssecMaterial,
+  answerFromZone: answerFromZone
 };
