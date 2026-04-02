@@ -16,14 +16,21 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  */
 
-var wire   = require('./wire');
-var server   = require('./server');
+import * as wire from './src/wire.js';
+import * as server from './src/server.js';
 
-module.exports = {
-  createServer: server.createServer,
-  buildDnssecMaterial: server.buildDnssecMaterial,
-  encodeMessage: wire.encodeMessage,
-  decodeMessage: wire.decodeMessage,
-  parseZone: wire.parseZone,
-  answerFromZone: server.answerFromZone
+export const createServer = server.createServer;
+export const buildDnssecMaterial = server.buildDnssecMaterial;
+export const encodeMessage = wire.encodeMessage;
+export const decodeMessage = wire.decodeMessage;
+export const parseZone = wire.parseZone;
+export const answerFromZone = server.answerFromZone;
+
+export default {
+  createServer,
+  buildDnssecMaterial,
+  encodeMessage,
+  decodeMessage,
+  parseZone,
+  answerFromZone
 };

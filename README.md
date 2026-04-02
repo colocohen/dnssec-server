@@ -38,6 +38,7 @@
   - [2. Add DS at your registrar (KSK)](#2-add-ds-at-your-registrar-ksk)
   - [3. Wire DNSSEC into the server](#3-wire-dnssec-into-the-server)
   - [4. Verify](#4-verify)
+  - [5. RRSIG Caching](#5-rrsig-caching)
 - [📦 Migrating from Zone Files](#-migrating-from-zone-files)
 - [🔎 Understanding ECS (EDNS Client Subnet)](#understanding-ecs-edns-client-subnet)
 - [🧩 Dynamic DNS Recipes (what you can build)](#dynamic-dns-recipes-what-you-can-build)
@@ -89,15 +90,25 @@ In short: **dnssec-server** lets you treat DNS as part of your codebase — not 
 npm i dnssec-server
 ```
 
+Works with both ESM and CommonJS:
+
+```js
+// ESM
+import DNSServer from 'dnssec-server';
+
+// CommonJS
+const DNSServer = require('dnssec-server');
+```
+
 
 # 🚀 Quick Start
 
 Below is a minimal authoritative server (UDP/TCP by default; enable DNS‑over‑TLS via `options.tls`). It returns an `A` record for `example.com.` and `NXDOMAIN` otherwise.
 
 ```js
-const fs = require('fs');
-const tls = require('tls');
-const DNSServer = require('dnssec-server');
+import fs from 'node:fs';
+import tls from 'node:tls';
+import DNSServer from 'dnssec-server';
 
 DNSServer.createServer({
   tls: { // enable DNS over TLS (DoT) on port 853 by default
@@ -159,10 +170,23 @@ Creates and starts an authoritative DNS server.
   - `tls` 
   *(false | { port?: number, address?: string, SNICallback?: (servername, cb) => void })* — enable DNS‑over‑TLS (default: **disabled**). Supply an `SNICallback` that returns a `SecureContext`.
   - `dnssec` *(optional)*
-  `{ keyCallback: (signersName: string, cb: (err, material|null) => void) }`. See [DNSSEC](#-enabling-dnssec).
+    - `keyCallback: (name: string, cb: (err, material | null) => void)` — called on every query with `DO=1` to retrieve signing keys. See [DNSSEC](#-enabling-dnssec).
+    - `cache` *(optional)* — RRSIG signature cache. See [RRSIG Caching](#-rrsig-caching). Can be:
+      - `true` — use built-in in-memory cache.
+      - `{ get, set }` — provide your own cache backend (Redis, LRU, etc.).
+      - omitted or `false` — no caching, sign every response.
+    - `cacheMax` *(number, default 10000)* — max entries for the built-in cache (only when `cache: true`).
+  - `onError` *(optional)* — `function(err, transport)` called on socket errors. `transport` is `'udp4'`, `'udp6'`, `'tcp'`, or `'tls'`. Without this, socket errors are silently ignored.
   - Other advanced knobs may exist; consult source for current options.
 - `handler(req, res)`
   your request handler. Populate `res.answers` / `res.authority` / `res.additionals` then call `res.send()`.
+
+**Returns** an object with:
+
+- `close(cb)` — gracefully shut down all transports.
+- `clearRrsigCache()` — clear the RRSIG signature cache (built-in mode).
+- `rrsigCacheSize()` — return number of cached signatures (built-in mode).
+- `context` — internal server context (for advanced use).
 
 > **Note**: Defaults above align with common expectations; if you need precise behavior (binding interfaces/ports, concurrency, etc.) refer to the code and examples.
 
@@ -172,17 +196,23 @@ Creates and starts an authoritative DNS server.
 Properties commonly used in logic:
 
 - `id` *(number)* — message ID.
-- `transport` *('udp'|'tcp'|'tls')* — which transport delivered the query.
+- `transport` *('udp4'|'udp6'|'tcp'|'tls'|'quic')* — which transport delivered the query.
 - `remoteAddress` *(string)*, `remotePort` *(number)* — client socket tuple (for ECS-aware setups prefer `ecsAddress`).
+- `client` *({ address, port, family })* — full client info including `'IPv4'` or `'IPv6'`.
 - `name` *(FQDN with trailing dot)* — qname, e.g. `example.com.`
 - `type` *(string)* — qtype, e.g. `A`, `AAAA`, `TXT`, ...
 - `class` *(string)* — typically `IN`.
-- `flag_rd` / `flag_cd` / `flag_ad` *(booleans)* — RD, CD, AD flags (if present).
+- `flag_qr` / `flag_aa` / `flag_tc` / `flag_rd` / `flag_ra` / `flag_ad` / `flag_cd` *(booleans)* — header flags.
 - `flag_do` *(boolean)* — DO bit (EDNS(0) DNSSEC OK).
+- `edns` *(object | undefined)* — full parsed EDNS data (udpSize, options, optionsStructured, etc.).
 - `edns_udp_size` *(number | undefined)* — advertised UDP payload size.
+- `ednsOptions` *(array | undefined)* — raw EDNS options list if you need to inspect.
 - `ecsAddress` *(string | undefined)* — **EDNS Client Subnet** address if sent by resolver.
 - `ecsSourcePrefixLength` *(number | undefined)* — ECS source prefix length.
-- `ednsOptions` *(array | undefined)* — raw EDNS options list if you need to inspect.
+- `ecsScopePrefixLength` *(number | undefined)* — ECS scope prefix length.
+- `tls` *(object | undefined)* — TLS info when transport is `'tls'` (includes `authorized`, `alpn`).
+- `raw` *(Uint8Array)* — original wire bytes.
+- `message` *(object)* — full decoded DNS message (header, questions, answers, etc.).
 
 
 ## Response (`res`) object
@@ -207,7 +237,7 @@ This is useful if you want to:
 - Unit-test DNS record encoding/decoding without running a full server.  
 
 ```js
-const { encodeMessage, decodeMessage } = require('dnssec-server');
+import { encodeMessage, decodeMessage } from 'dnssec-server';
 
 // Decode a raw DNS query from a Buffer/Uint8Array
 const query = decodeMessage(rawBuffer);
@@ -295,7 +325,7 @@ Example:
 The library **handles DNSSEC automatically**. Just pass the object returned by `buildDnssecMaterial` into the server via `dnssec.keyCallback`. No manual DNSKEY publishing is needed — `dnssec-server` will expose the DNSKEYs and serve signed responses.
 
 ```js
-const DNSServer = require('dnssec-server');
+import DNSServer from 'dnssec-server';
 
 // 1) Generate (or load) DNSSEC material
 const dnssec_material_obj = DNSServer.buildDnssecMaterial({
@@ -345,6 +375,105 @@ dig +dnssec example.com A
 Or use [dnssec-debugger.verisignlabs.com](https://dnssec-debugger.verisignlabs.com) to confirm everything validates.
 
 
+## 5. RRSIG Caching
+
+ECDSA P-256 signing takes ~1–5ms per RRset. If many clients query the same records, the server re-signs identical responses unnecessarily. RRSIG caching avoids this by reusing previously computed signatures.
+
+**No cache (default)** — every response is signed fresh:
+
+```js
+DNSServer.createServer({
+  dnssec: { keyCallback: myKeyCallback }
+}, handler);
+```
+
+**Built-in in-memory cache** — simple and zero-config:
+
+```js
+DNSServer.createServer({
+  dnssec: {
+    keyCallback: myKeyCallback,
+    cache: true,
+    cacheMax: 5000   // optional, default 10000
+  }
+}, handler);
+```
+
+**Custom cache backend** — full control over storage (Redis, LRU, database, etc.):
+
+```js
+DNSServer.createServer({
+  dnssec: {
+    keyCallback: myKeyCallback,
+    cache: {
+      get: function (params, cb) {
+        // params: { name, type, class, keyTag, hash }
+        // Return cached value or null for cache miss
+        redis.get(params.hash + ':' + params.keyTag, function (err, raw) {
+          cb(err, raw ? JSON.parse(raw) : null);
+        });
+      },
+      set: function (params, value, cb) {
+        // value: { rrsig, expiration, inception }
+        var key = params.hash + ':' + params.keyTag;
+        var ttl = value.expiration - Math.floor(Date.now() / 1000);
+        redis.setex(key, ttl, JSON.stringify(value), cb);
+      }
+    }
+  }
+}, handler);
+```
+
+### Cache `get` callback
+
+Called before signing. If it returns a valid cached entry, signing is skipped.
+
+```js
+get(params, cb)
+```
+
+`params` contains:
+
+- `name` *(string)* — owner name of the RRset, e.g. `'example.com.'`
+- `type` *(string)* — RR type, e.g. `'A'`, `'AAAA'`, `'DNSKEY'`
+- `class` *(string)* — RR class, e.g. `'IN'`
+- `keyTag` *(number)* — key tag of the signing key
+- `hash` *(string)* — SHA-256 hex digest of the canonical RRset bytes (changes when record content changes)
+
+Call `cb(null, cachedValue)` on hit, `cb(null, null)` on miss, or `cb(err)` on error (will sign without caching).
+
+
+### Cache `set` callback
+
+Called after signing a new RRSIG. Store the value however you like.
+
+```js
+set(params, value, cb)
+```
+
+`params` is the same object as `get`. `value` contains:
+
+- `rrsig` *(object)* — the full RRSIG record, ready to push to answers
+- `expiration` *(number)* — UNIX timestamp when the signature expires
+- `inception` *(number)* — UNIX timestamp when the signature becomes valid
+
+Call `cb(null)` when done. Errors don't affect the response (the signature was already computed).
+
+
+### Server cache control
+
+The object returned by `createServer` provides:
+
+```js
+const server = DNSServer.createServer({ ... }, handler);
+
+server.clearRrsigCache();     // flush all cached signatures
+server.rrsigCacheSize();      // number of cached entries (built-in mode)
+```
+
+These are useful after key rollover or zone updates to force re-signing.
+
+
 # 📦 Migrating from Zone Files
 
 If you are already operating an external DNS server (such as **BIND**) and maintaining your zones in standard **zone files**, you don’t need to rewrite your data.  
@@ -371,9 +500,9 @@ This approach makes migration seamless:
 ## Example: load multiple zone files and serve them
 
 ```js
-const fs = require('fs');
-const tls = require('tls');
-const DNSServer = require('dnssec-server');
+import fs from 'node:fs';
+import tls from 'node:tls';
+import DNSServer from 'dnssec-server';
 
 // 1) Load and parse multiple BIND-style zone files (sync for simplicity)
 const zones = {

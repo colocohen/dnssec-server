@@ -1,9 +1,30 @@
 {
   "name": "dnssec-server",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "📡 Pure JavaScript authoritative DNS server for Node.js with built-in DNSSEC, dynamic zones, and modern record support.",
-  "main": "index.js",
-  "type": "commonjs",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "src",
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "npm run build"
+  },
   "keywords": [
     "backend",
     "packet",
@@ -43,10 +64,7 @@
     "url": "https://github.com/colocohen/dnssec-server/issues"
   },
   "homepage": "https://github.com/colocohen/dnssec-server#readme",
-  "dependencies": {
-    "@noble/curves": ">=1.9.6",
-    "@noble/hashes": ">=1.8.0"
-  },
+  "dependencies": {},
   "funding": [
     {
       "type": "github",
@@ -56,5 +74,9 @@
       "type": "opencollective",
       "url": "https://opencollective.com/colocohen"
     }
-  ]
+  ],
+  "devDependencies": {
+    "tsup": "^8.5.1",
+    "typescript": "^5.0.0"
+  }
 }
