@@ -23,6 +23,8 @@ import crypto from 'node:crypto';
 
 import * as wire from './wire.js';
 import { fqdn, ensureDot } from './utils.js';
+// NOTE: the QUIC transport ('quico') is loaded lazily inside startQuicServer(),
+// so it is an optional dependency — required only when options.quic is used.
 
 
 // ---------------------------------------------------------------
@@ -200,7 +202,7 @@ function buildRes(req, serverCtx){
       udpSize: req.edns.udpSize,
       extRcode: 0,
       version: 0,
-      do: false,
+      do: !!req.edns.do, // echo DO (RFC 6891 ignores it in responses, but echoing aids debugging)
       z: 0,
       options: []
     } : undefined,
@@ -229,23 +231,39 @@ function encodeNow(res, req){
 }
 
 function truncateSmart(serverCtx, req, res, udpMax){
-  // priority: keep OPT, trim additionals → authority → answers (section-level for simplicity)
+  // Priority: keep OPT + answers as long as possible.
+  // Sections are removed CUMULATIVELY (additionals, then also authority, then also answers) —
+  // removals must stack, otherwise a message whose sections are individually too small to
+  // matter can never be brought under udpMax.
   var tryOrder = ['additionals','authority','answers'];
+  var saved = {};
   res.header.tc = true;
+
+  var wireOut = null;
   for (var i=0;i<tryOrder.length;i++){
     var sec = tryOrder[i];
     if (res[sec] && res[sec].length){
-      var save = res[sec];
+      saved[sec] = res[sec];
       res[sec] = [];
       var w = encodeNow(res, req);
-      if (w.length <= udpMax) return w;
-      // not enough — restore and continue trimming next section
-      res[sec] = save;
+      if (w.length <= udpMax){ wireOut = w; break; }
     }
   }
-  // if still too large — hard truncation as last resort
-  var w2 = encodeNow(res, req);
-  return toU8(w2).slice(0, udpMax);
+
+  if (wireOut === null){
+    // Everything stripped and still too large (huge question / tiny udpMax):
+    // send header + question only, without EDNS. NEVER slice raw bytes —
+    // a byte-sliced message has header counts that lie about its contents.
+    var savedEdns = res.edns;
+    res.edns = undefined;
+    wireOut = encodeNow(res, req);
+    res.edns = savedEdns;
+    // (header[12] + question[<=281] always fits any legal 512+ byte UDP limit)
+  }
+
+  // restore sections so `res` remains inspectable after send
+  for (var k in saved) res[k] = saved[k];
+  return wireOut;
 }
 
 function finalizeWire(serverCtx, req, res){
@@ -317,17 +335,131 @@ function signRRset(signer_name,rrset_bytes,algorithm,key_tag,sig_expiration,sig_
   
 }
 
+// RFC 4034 §3.1.3: the Labels field is the number of labels in the owner name,
+// NOT counting the root and NOT counting a leftmost '*' (wildcard) label.
+function rrsigLabelCount(name){
+  var l = String(name || '.').replace(/\.$/, '').split('.').filter(Boolean);
+  if (l.length && l[0] === '*') l.shift();
+  return l.length;
+}
+
+// Group records into RRsets by (name, type, class). RRSIG/OPT are never re-signed.
+function groupRRsets(rrs){
+  var groups = new Map();
+  for (var i=0;i<(rrs?rrs.length:0);i++){
+    var rr = rrs[i];
+    if (!rr) continue;
+    var t = String(rr.type).toUpperCase();
+    if (t === 'RRSIG' || t === 'OPT') continue;
+    var key = fqdn(rr.name) + '|' + t + '|' + (rr.class || 'IN');
+    var arr = groups.get(key);
+    if (!arr){ arr = []; groups.set(key, arr); }
+    arr.push(rr);
+  }
+  return Array.from(groups.values());
+}
+
+// Minimal async series iterator (the cache API is callback-based).
+function eachSeries(items, iter, done){
+  var i = 0;
+  (function next(err){
+    if (err || i >= items.length) return done(err || null);
+    iter(items[i++], next);
+  })();
+}
+
+// Sign one RRset (with cache) and invoke cb(err, rrsigRecord|null).
+function signRRsetWithCache(ctx, material, rrset, cb){
+  var first = rrset[0];
+  var typeUpper = String(first.type).toUpperCase();
+  var rrset_bytes;
+  try {
+    rrset_bytes = wire.buildRRsetBytesFromAnswers(rrset);
+  } catch(e){ return cb(e); }
+
+  // DNSKEY RRsets are signed with the KSK; everything else with the ZSK.
+  var key = (typeUpper === 'DNSKEY') ? material.ksk : material.zsk;
+  if (!key || !key.privateKey) return cb(null, null);
+
+  var now = Math.floor(Date.now() / 1000);
+  // Validity window: taken from the key material if provided, otherwise sane
+  // defaults. The user's material object is never mutated.
+  var inception  = (typeof key.inception  === 'number' && key.inception  > 0) ? key.inception  : now - 300;
+  var expiration = (typeof key.expiration === 'number' && key.expiration > 0) ? key.expiration : now + (346 * 24 * 3600);
+
+  var cacheParams = {
+    name: first.name,
+    type: typeUpper,
+    class: first.class || 'IN',
+    keyTag: Number(key.keyTag),
+    hash: toHex(sha256(rrset_bytes))
+  };
+
+  function doSign(){
+    var labels = rrsigLabelCount(first.name);
+    var sig_data = signRRset(material.signersName, rrset_bytes, 13, key.keyTag,
+                             expiration, inception, key.privateKey, labels, typeUpper, first.ttl);
+    var rrsig_record = {
+      name: first.name,
+      type: 'RRSIG',
+      class: first.class || 'IN',
+      ttl: first.ttl,
+      data: {
+        typeCovered: wire.type_to_code[typeUpper] || 0,
+        algorithm: 13,
+        labels: labels,
+        originalTTL: first.ttl,
+        expiration: expiration,
+        inception: inception,
+        keyTag: Number(key.keyTag),
+        signersName: material.signersName,
+        signature: sig_data,
+      }
+    };
+    if (ctx._dnssecCache){
+      try { ctx._dnssecCache.set(cacheParams, { rrsig: rrsig_record, expiration: expiration, inception: inception }, function(){}); } catch(e){}
+    }
+    return rrsig_record;
+  }
+
+  if (ctx._dnssecCache){
+    ctx._dnssecCache.get(cacheParams, function(err, cached){
+      if (!err && cached && cached.rrsig && cached.expiration > now && cached.inception <= now){
+        cb(null, cached.rrsig);
+      } else {
+        try { cb(null, doSign()); } catch(e){ cb(e); }
+      }
+    });
+  } else {
+    try { cb(null, doSign()); } catch(e){ cb(e); }
+  }
+}
+
 function sendResponse(ctx, req, res){
+  var onError = (ctx && ctx.options && typeof ctx.options.onError === 'function') ? ctx.options.onError : function(){};
+
+  // res.send() is one-shot: a second call would emit a duplicate response on the wire.
+  if (res._sent){
+    onError(new Error('res.send() called more than once for query "' + req.name + '" — response already sent'), req.transport);
+    return;
+  }
+  res._sent = true;
 
   function actual_send(){
-    var wire2 = finalizeWire(ctx, req, res);
+    var wire2;
+    try {
+      wire2 = finalizeWire(ctx, req, res);
+    } catch(e){
+      onError(e, req.transport);
+      return;
+    }
 
     if (req.transport === 'udp4' || req.transport === 'udp6'){
       if (req._udp) req._udp.send(wire2, req.client.port, req.client.address);
       return;
     }
     if (req.transport === 'tcp' || req.transport === 'tls'){
-      if (req._socket){
+      if (req._socket && !req._socket.destroyed){
         var frame = Buffer.allocUnsafe(2 + wire2.length);
         frame.writeUInt16BE(wire2.length, 0);
         frame.set(wire2, 2);
@@ -341,117 +473,50 @@ function sendResponse(ctx, req, res){
     }
   }
 
-  var rrsig_exist=false;
-  for(var i=0;i<res.answers.length;i++){
-    if(res.answers[i] && res.answers[i].type==='RRSIG'){
-      rrsig_exist=true;
-      break;
+  // If the handler already supplied RRSIGs anywhere, it is managing DNSSEC manually — don't interfere.
+  var rrsig_exist = false;
+  var sections = [res.answers, res.authority];
+  for (var s=0; s<sections.length && !rrsig_exist; s++){
+    var sec = sections[s] || [];
+    for (var i=0;i<sec.length;i++){
+      if (sec[i] && String(sec[i].type).toUpperCase() === 'RRSIG'){ rrsig_exist = true; break; }
     }
   }
 
-  if(rrsig_exist===false && res.answers.length>0 && req.flag_do===true && ctx && ctx.options && ctx.options.dnssec && typeof ctx.options.dnssec.keyCallback==='function'){
+  var wantSign = !rrsig_exist &&
+                 req.flag_do === true &&
+                 ctx && ctx.options && ctx.options.dnssec &&
+                 typeof ctx.options.dnssec.keyCallback === 'function' &&
+                 ((res.answers && res.answers.length) || (res.authority && res.authority.length));
 
-    ctx.options.dnssec.keyCallback(req.name,function(error,result){
-
-      if(result){
-        try{
-          var rrset_bytes=wire.buildRRsetBytesFromAnswers(res.answers);
-
-          var labels=String(res.answers[0].name).replace(/\.$/, '').split('.').length;
-
-          var the_key=null;
-          if(res.answers[0].type==='DNSKEY'){
-            the_key=result.ksk;
-          }else{
-            the_key=result.zsk;
-          }
-
-          var timestamp_now = Math.floor(Date.now() / 1000);
-
-          if(!('inception' in the_key) || the_key.inception<=0 || typeof the_key.inception!=='number'){
-            the_key.inception=timestamp_now - 300;
-          }
-
-          if(!('expiration' in the_key) || the_key.expiration<=0 || typeof the_key.expiration!=='number'){
-            the_key.expiration=timestamp_now + (346 * 24 * 3600);
-          }
-
-          // --- params object shared by cache.get and cache.set ---
-          var cacheParams = {
-            name: res.answers[0].name,
-            type: res.answers[0].type,
-            class: res.answers[0].class || 'IN',
-            keyTag: Number(the_key.keyTag),
-            hash: toHex(sha256(rrset_bytes))
-          };
-
-          function doSign(){
-            var sig_data = signRRset(result.signersName, rrset_bytes, 13, the_key.keyTag, the_key.expiration, the_key.inception, the_key.privateKey, labels, res.answers[0].type, res.answers[0].ttl);
-
-            var rrsig_record = {
-              name: res.answers[0].name,
-              type: 'RRSIG',
-              class: res.answers[0].class,
-              ttl: res.answers[0].ttl,
-              data: {
-                typeCovered: wire.type_to_code[res.answers[0].type.toUpperCase()] || 0,
-                algorithm: 13,
-                labels: labels,
-                originalTTL: res.answers[0].ttl,
-                expiration: the_key.expiration,
-                inception: the_key.inception,
-                keyTag: Number(the_key.keyTag),
-                signersName: result.signersName,
-                signature: sig_data,
-              }
-            };
-
-            // store in cache if available
-            if (ctx._dnssecCache){
-              var cacheValue = { rrsig: rrsig_record, expiration: the_key.expiration, inception: the_key.inception };
-              try { ctx._dnssecCache.set(cacheParams, cacheValue, function(){}); } catch(e){}
-            }
-
-            return rrsig_record;
-          }
-
-          function appendAndSend(rrsig_record){
-            res.answers.push(rrsig_record);
-            res.additionals.push({
-              type: 'OPT',
-              name: '.',
-              edns: { udpSize: 4096, extRcode: 0, version: 0, do: true, options: [] }
-            });
-            actual_send();
-          }
-
-          // --- cache lookup or sign ---
-          if (ctx._dnssecCache){
-            ctx._dnssecCache.get(cacheParams, function(err, cached){
-              if (!err && cached && cached.rrsig && cached.expiration > timestamp_now && cached.inception <= timestamp_now){
-                appendAndSend(cached.rrsig);
-              } else {
-                appendAndSend(doSign());
-              }
-            });
-          } else {
-            appendAndSend(doSign());
-          }
-
-        }catch(e2){
-          console.log(e2);
-          actual_send();
-        }
-      }else{
-        actual_send();
-      }
-
-    });
-
-  }else{
+  if (!wantSign){
     actual_send();
+    return;
   }
-  
+
+  ctx.options.dnssec.keyCallback(req.name, function(error, material){
+    if (error || !material){
+      actual_send();
+      return;
+    }
+
+    // Sign every RRset in answers AND authority (e.g. the SOA on negative responses).
+    // Each RRset gets its own RRSIG, appended to the same section.
+    var work = [];
+    groupRRsets(res.answers).forEach(function(g){ work.push({ section: res.answers, rrset: g }); });
+    groupRRsets(res.authority).forEach(function(g){ work.push({ section: res.authority, rrset: g }); });
+
+    eachSeries(work, function(item, next){
+      signRRsetWithCache(ctx, material, item.rrset, function(err, rrsig){
+        if (err) return next(err);
+        if (rrsig) item.section.push(rrsig);
+        next();
+      });
+    }, function(err){
+      if (err) onError(err, req.transport); // send unsigned rather than dropping the query
+      actual_send();
+    });
+  });
 }
 
 
@@ -462,7 +527,10 @@ function autoAnswerIfApplicable(req, res, ctx, callback){
 
       ctx.options.dnssec.keyCallback(req.name,function(error,result){
 
-        if(result){
+        // Only auto-answer when the query name is exactly the zone the keys belong to.
+        // A DNSKEY query for e.g. a subdomain must reach the user handler — answering it
+        // with records whose owner differs from the qname would be a bogus response.
+        if(result && fqdn(result.signersName) === fqdn(req.name)){
           if(result.ksk){
             res.answers.push({
               name: result.signersName,
@@ -510,10 +578,117 @@ function autoAnswerIfApplicable(req, res, ctx, callback){
 
 
 // ---------------------------------------------------------------
-// DNS over QUIC stub (not implemented yet)
+// DNS over QUIC — RFC 9250
 // ---------------------------------------------------------------
 function startQuicServer(serverCtx, quicOpt, handler){
-  serverCtx.quic = { options: quicOpt, close: function(cb){ cb&&cb(); } };
+  var onError = typeof serverCtx.options.onError === 'function'
+    ? serverCtx.options.onError
+    : function(){};
+
+  // 'quico' is an optional dependency: loaded only when QUIC is actually enabled,
+  // so users who don't need DoQ don't need the package installed.
+  import('quico').then(function(mod){
+    startQuicServerWith(mod.createQuicServer, serverCtx, quicOpt, handler, onError);
+  }).catch(function(err){
+    onError(new Error("DNS-over-QUIC requires the optional 'quico' package (npm i quico): " + err.message), 'quic');
+  });
+}
+
+function startQuicServerWith(createQuicServer, serverCtx, quicOpt, handler, onError){
+  var quicSrv = createQuicServer({
+    alpn:           quicOpt.alpn           || ['doq'],
+    key:            quicOpt.key,
+    cert:           quicOpt.cert,
+    ca:             quicOpt.ca             || undefined,
+    SNICallback:    quicOpt.SNICallback    || undefined,
+    maxConnections: quicOpt.maxConnections || 10000
+  });
+
+  quicSrv.on('error', function(err){ onError(err, 'quic'); });
+
+  quicSrv.on('connection', function(quic, peer){
+
+    // Per-connection buffer: one Uint8Array accumulator per stream id.
+    // Both the number of concurrently-open (un-FINed) streams and the bytes
+    // buffered per stream are capped — a hostile client opening streams it
+    // never finishes must not accumulate memory for the connection's lifetime.
+    var streamBufs = {};
+    var openStreams = 0;
+    var MAX_OPEN_STREAMS = (quicOpt.maxOpenStreams|0) || 100;
+    var MAX_STREAM_BYTES = 2 + 65535; // DoQ: one length-prefixed DNS message per stream
+
+    quic.on('stream', function(streamId, chunk, fin){
+      // Accumulate chunks — DoQ sends one DNS query per bidi stream.
+      if (!streamBufs[streamId]){
+        if (openStreams >= MAX_OPEN_STREAMS){ if (quic.close) quic.close(); return; }
+        streamBufs[streamId] = { parts: [], total: 0 };
+        openStreams++;
+      }
+      var sb = streamBufs[streamId];
+      if (chunk && chunk.byteLength > 0){
+        sb.total += chunk.byteLength;
+        if (sb.total > MAX_STREAM_BYTES){ delete streamBufs[streamId]; openStreams--; return; }
+        sb.parts.push(chunk);
+      }
+      if (!fin) return;
+
+      // Reassemble and remove buffer entry.
+      var parts = sb.parts;
+      delete streamBufs[streamId];
+      openStreams--;
+
+      var total = 0;
+      for (var i = 0; i < parts.length; i++) total += parts[i].byteLength;
+      var full = new Uint8Array(total);
+      var off  = 0;
+      for (var i = 0; i < parts.length; i++){ full.set(parts[i], off); off += parts[i].byteLength; }
+
+      // DoQ framing: 2-byte big-endian length prefix (RFC 9250 §4.2).
+      if (full.byteLength < 2) return;
+      var msgLen = (full[0] << 8) | full[1];
+      var body   = full.subarray(2, 2 + msgLen);
+      if (body.byteLength < msgLen) return; // truncated — drop
+
+      var msg;
+      try { msg = wire.decodeMessage(body); } catch(e){ return; }
+
+      // Capture streamId in closure for the send callback below.
+      var sid = streamId;
+      var sendHandle = {
+        send: function(data){
+          // DoQ response: 2-byte length prefix + DNS wire bytes (RFC 9250 §4.2).
+          var frame = new Uint8Array(2 + data.length);
+          frame[0] = (data.length >> 8) & 0xFF;
+          frame[1] =  data.length       & 0xFF;
+          frame.set(data, 2);
+          quic.sendStream(sid, frame, true); // fin=true — one query per stream
+        }
+      };
+
+      var req = buildReq('quic', peer, body, msg, { alpn: 'doq' });
+      req._quic = sendHandle;
+
+      var res = buildRes(req, serverCtx);
+
+      autoAnswerIfApplicable(req, res, serverCtx, function(is_sent){
+        if (is_sent === false) handler(req, res);
+      });
+    });
+
+    quic.on('close', function(){
+      streamBufs = {};
+      openStreams = 0;
+    });
+
+  });
+
+  quicSrv.listen(
+    quicOpt.port || 853,
+    quicOpt.host || '::',
+    function(){ if (quicOpt.onListen) quicOpt.onListen(); }
+  );
+
+  serverCtx.quic = quicSrv;
 }
 
 // ---------------------------------------------------------------
@@ -549,17 +724,22 @@ function createServer(options, handler){
       // developer-provided cache
       dnssecCache = cacheOpt;
     } else if (cacheOpt === true){
-      // built-in in-memory cache
+      // built-in in-memory LRU cache: a Map preserves insertion order, so
+      // re-inserting on read keeps the most-recently-used entries at the end
+      // and lets us evict the single oldest entry instead of wiping everything.
       var _map = new Map();
       var _mapMax = (options.dnssec.cacheMax|0) || 10000;
       dnssecCache = {
         get: function(params, cb){
           var k = params.hash + '|' + params.keyTag;
-          cb(null, _map.get(k) || null);
+          var v = _map.get(k);
+          if (v !== undefined){ _map.delete(k); _map.set(k, v); } // refresh recency
+          cb(null, v || null);
         },
         set: function(params, value, cb){
           var k = params.hash + '|' + params.keyTag;
-          if (_map.size >= _mapMax) _map.clear();
+          if (_map.has(k)) _map.delete(k);
+          else if (_map.size >= _mapMax) _map.delete(_map.keys().next().value); // evict LRU
           _map.set(k, value);
           if (cb) cb(null);
         },
@@ -690,13 +870,27 @@ function createServer(options, handler){
   }
 
   // --- Shared DNS-over-stream handler (TCP + TLS) ---
+  // Live sockets are tracked so server.close() can destroy them: net's close()
+  // only stops accepting — a single idle client would otherwise hold the port
+  // forever and starve blue-green reloads with endless EADDRINUSE.
+  serverCtx._streamSockets = new Set();
+
+  // A DNS message is at most 65535 bytes + 2-byte length prefix. Any connection
+  // buffering more than that without completing a message is malformed or hostile.
+  var MAX_CONN_BUFFER = 2 + 65535;
+
   function handleStreamSocket(socket, transport, idleMs){
     var chunks = [];
     var totalLen = 0;
 
+    serverCtx._streamSockets.add(socket);
+    socket.on('close', function(){ serverCtx._streamSockets.delete(socket); });
+
     socket.on('data', function(chunk){
       chunks.push(chunk);
       totalLen += chunk.length;
+
+      if (totalLen > MAX_CONN_BUFFER){ socket.destroy(); return; }
 
       // assemble only when needed
       var buf = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, totalLen);
@@ -714,7 +908,8 @@ function createServer(options, handler){
         } catch(e){ socket.destroy(); return; }
       }
 
-      // keep only the unparsed remainder
+      // keep only the unparsed remainder — chunks is reset so consumed
+      // Buffers become garbage-collectable instead of accumulating
       if (buf.length === 0){
         chunks = [];
         totalLen = 0;
@@ -724,7 +919,10 @@ function createServer(options, handler){
       }
     });
 
-    if (idleMs > 0) socket.setTimeout(idleMs, function(){ socket.destroy(); });
+    // Idle timeout ALWAYS applies (default 30s). Without it, lazy or hostile
+    // clients hold sockets (and their buffers) open indefinitely.
+    var effectiveIdle = (idleMs != null && idleMs > 0) ? idleMs : 30000;
+    socket.setTimeout(effectiveIdle, function(){ socket.destroy(); });
     socket.on('error', function(err){ onError(err, transport); });
   }
 
@@ -733,6 +931,11 @@ function createServer(options, handler){
     var tcp = net.createServer(function(socket){
       handleStreamSocket(socket, 'tcp', tcpOpt.idleMs || 0);
     });
+    // Without this, a bind failure (e.g. EADDRINUSE) is an uncaught exception
+    // that kills the process — it must reach onError like UDP errors do,
+    // so callers can implement retry/failover logic.
+    tcp.on('error', function(err){ onError(err, 'tcp'); });
+    if (tcpOpt.maxConnections > 0) tcp.maxConnections = tcpOpt.maxConnections|0; // cap aggregate memory
     tcp.listen((tcpOpt.port|0) || 53, tcpOpt.host || '::');
     serverCtx.tcp = tcp;
   }
@@ -743,6 +946,8 @@ function createServer(options, handler){
     var tlsSrv = tls.createServer(tlsOpt, function(socket){
       handleStreamSocket(socket, 'tls', tlsOpt.idleMs || 0);
     });
+    tlsSrv.on('error', function(err){ onError(err, 'tls'); }); // bind errors must not crash the process
+    if (tlsOpt.maxConnections > 0) tlsSrv.maxConnections = tlsOpt.maxConnections|0;
     tlsSrv.listen((tlsOpt.port|0) || 853, tlsOpt.host || '::');
     serverCtx.tls = tlsSrv;
   }
@@ -759,7 +964,19 @@ function createServer(options, handler){
       if (serverCtx.tcp){ pending++; serverCtx.tcp.close(done); }
       if (serverCtx.tls){ pending++; serverCtx.tls.close(done); }
       if (serverCtx.quic && serverCtx.quic.close){ pending++; serverCtx.quic.close(done); }
+
+      // Destroy live TCP/TLS connections: without this, net's close() waits for
+      // clients to hang up voluntarily — one idle client blocks shutdown forever
+      // (and keeps the port held during blue-green reloads).
+      if (serverCtx._streamSockets){
+        for (var s of serverCtx._streamSockets) s.destroy();
+        serverCtx._streamSockets.clear();
+      }
+
       if (pending===0 && cb) cb();
+    },
+    connectionCount: function(){
+      return serverCtx._streamSockets ? serverCtx._streamSockets.size : 0;
     },
     clearRrsigCache: function(){
       if (serverCtx._dnssecCache && typeof serverCtx._dnssecCache.clear === 'function'){
@@ -826,9 +1043,9 @@ function computeDnskeyKeyTag(rdata){
   var acc = 0;
   for (var i = 0; i < rdata.length; i++){
     acc += (i & 1) ? rdata[i] : (rdata[i] << 8);
-    acc &= 0xFFFFFFFF;
+    acc = acc >>> 0; // keep unsigned — `& 0xFFFFFFFF` yields a SIGNED int32 and corrupts large accumulations
   }
-  acc += (acc >> 16) & 0xFFFF;
+  acc += (acc >>> 16) & 0xFFFF;
   return acc & 0xFFFF;
 }
 
@@ -899,26 +1116,39 @@ function buildDnssecMaterial(params){
 
 /////////////////
 
-// Build a lazy name→RR[] index on the zone object (created once, reused on every query)
+// Build a lazy name→RR[] index on the zone object (created once, reused on every query).
+// Keys are lowercase FQDNs: DNS names are case-insensitive (RFC 1034 §3.1, RFC 4343),
+// and real-world resolvers actively randomize query case (dns0x20 anti-spoofing),
+// so a case-sensitive index would fail a large share of legitimate queries.
 function getZoneIndex(zone){
   if (zone._index) return zone._index;
   var idx = new Map();
+  var soaApex = null, soaAny = null;
+  var apex = fqdn(zone.origin || '.');
   for (var i = 0; i < zone.records.length; i++){
     var rr = zone.records[i];
-    var arr = idx.get(rr.name);
-    if (!arr){ arr = []; idx.set(rr.name, arr); }
+    var key = fqdn(rr.name);
+    var arr = idx.get(key);
+    if (!arr){ arr = []; idx.set(key, arr); }
     arr.push(rr);
+    if (rr.type === 'SOA'){
+      if (key === apex) soaApex = rr;
+      if (!soaAny) soaAny = rr;
+    }
   }
   zone._index = idx;
+  zone._soa = soaApex || soaAny; // cached — findSOA used to rescan the whole zone on every miss
   return idx;
 }
+
+var MAX_CNAME_CHAIN = 8;
 
 function answerFromZone(zone,qname,qtype,qclass){
   qtype = (qtype||'A').toUpperCase();
   qclass = (qclass||'IN').toUpperCase();
 
   var idx = getZoneIndex(zone);
-  var fq = ensureDot(qname);
+  var fq = fqdn(qname);
 
   function existsName(name){ return idx.has(name); }
   function collect(name, type){
@@ -930,15 +1160,13 @@ function answerFromZone(zone,qname,qtype,qclass){
     return out;
   }
   function collectAllTypes(name){ return idx.get(name) || []; }
-  function findSOA(){
-    var apex = zone.origin || '.';
-    var best=null;
-    for (var i=0;i<zone.records.length;i++){
-      var rr=zone.records[i];
-      if (rr.type==='SOA' && rr.name===apex) return rr;
-      if (!best && rr.type==='SOA') best = rr;
-    }
-    return best;
+  function negativeSOA(){
+    // RFC 2308 §5: the TTL of the SOA in a negative response is capped by SOA.minimum.
+    var soa = zone._soa;
+    if (!soa) return null;
+    var negTtl = Math.min(soa.ttl >>> 0, (soa.data && soa.data.minimum != null) ? (soa.data.minimum >>> 0) : (soa.ttl >>> 0));
+    if (negTtl === (soa.ttl >>> 0)) return soa;
+    return { name: soa.name, type: soa.type, class: soa.class, ttl: negTtl, data: soa.data };
   }
   function wildcardLookup(name, type){
     if (name === '.') return [];
@@ -957,29 +1185,69 @@ function answerFromZone(zone,qname,qtype,qclass){
     }
     return [];
   }
+  // Resolve one step for (name,type): exact match, then CNAME at name, then wildcard.
+  // Returns { rrs, via } where via is 'exact' | 'cname' | 'wildcard' | null.
+  function resolveStep(name, type){
+    var exact = collect(name, type);
+    if (exact.length) return { rrs: exact, via: 'exact' };
+    if (type !== 'CNAME' && type !== 'ANY'){
+      var cn = collect(name, 'CNAME');
+      if (cn.length) return { rrs: cn, via: 'cname' };
+    }
+    if (!existsName(name)){
+      var wc = wildcardLookup(name, type);
+      if (wc.length) return { rrs: wc, via: 'wildcard' };
+      if (type !== 'CNAME' && type !== 'ANY'){
+        var wcn = wildcardLookup(name, 'CNAME');
+        if (wcn.length) return { rrs: wcn, via: 'cname' };
+      }
+    }
+    return { rrs: [], via: null };
+  }
 
-  // exact
-  var answers = collect(fq, qtype);
-  if (answers.length){
-    var out = { rcode:0, answers:answers, authority:[], additionals:[], reason:'exact' };
-    addGlue(out.answers, out.additionals);
-    addSvcbHttpsHints(out.answers, out.additionals);
-    return out;
+  // Main resolution loop: follows CNAME chains inside the zone (RFC 1034 §3.6.2 —
+  // a query for type X on a name that owns a CNAME must return the CNAME and
+  // restart resolution at the canonical name).
+  var answers = [];
+  var reason = null;
+  var current = fq;
+  var seen = new Set();
+
+  for (var hop = 0; hop <= MAX_CNAME_CHAIN; hop++){
+    if (seen.has(current)) break; // CNAME loop — stop, return what we have
+    seen.add(current);
+
+    var step = resolveStep(current, qtype);
+    if (!step.via){
+      if (answers.length){
+        // chain ended at a name we don't own — return the partial chain, resolver continues
+        break;
+      }
+      // no match at all for the original qname
+      if (existsName(current)){
+        var soaN = negativeSOA();
+        return { rcode:0, answers:[], authority: soaN?[soaN]:[], additionals:[], reason:'NODATA' };
+      }
+      var soaX = negativeSOA();
+      return { rcode:3, answers:[], authority: soaX?[soaX]:[], additionals:[], reason:'NXDOMAIN' };
+    }
+
+    Array.prototype.push.apply(answers, step.rrs);
+    if (!reason) reason = step.via;
+
+    if (step.via === 'cname' && qtype !== 'CNAME'){
+      var target = step.rrs[0] && step.rrs[0].data && step.rrs[0].data.name;
+      if (!target) break;
+      current = fqdn(target);
+      continue; // chase the canonical name
+    }
+    break; // exact / wildcard / terminal
   }
-  if (existsName(fq)){
-    var soa = findSOA();
-    return { rcode:0, answers:[], authority: soa?[soa]:[], additionals:[], reason:'NODATA' };
-  }
-  // wildcard
-  var wc = wildcardLookup(fq, qtype);
-  if (wc.length){
-    var out2 = { rcode:0, answers:wc, authority:[], additionals:[], reason:'wildcard' };
-    addGlue(out2.answers, out2.additionals);
-    addSvcbHttpsHints(out2.answers, out2.additionals);
-    return out2;
-  }
-  var soa2 = findSOA();
-  return { rcode:3, answers:[], authority: soa2?[soa2]:[], additionals:[], reason:'NXDOMAIN' };
+
+  var out = { rcode:0, answers:answers, authority:[], additionals:[], reason: reason || 'exact' };
+  addGlue(out.answers, out.additionals);
+  addSvcbHttpsHints(out.answers, out.additionals);
+  return out;
 
   function addGlue(rrs, out){
     for (var i=0;i<rrs.length;i++){
@@ -990,7 +1258,7 @@ function answerFromZone(zone,qname,qtype,qclass){
       else if (rr.type==='NS' && rr.data && rr.data.name) targets.push(rr.data.name);
       else if ((rr.type==='SVCB'||rr.type==='HTTPS') && rr.data && rr.data.targetName) targets.push(rr.data.targetName);
       for (var t=0;t<targets.length;t++){
-        var name=targets[t];
+        var name=fqdn(targets[t]);
         var a4 = collect(name,'A'); if (a4.length) Array.prototype.push.apply(out, a4);
         var a6 = collect(name,'AAAA'); if (a6.length) Array.prototype.push.apply(out, a6);
       }

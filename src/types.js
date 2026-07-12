@@ -23,9 +23,28 @@ for(var type in type_to_code){
     };
 }
 
-// Shared buffer for name encoding — reused across calls (safe: all encode functions are synchronous)
-var _nameBuf = new Uint8Array(512);
+// Shared buffer for name/RDATA encoding — reused across calls (safe: all encode functions are synchronous).
+// 4096 bytes: some encoders write multiple names plus fixed fields into this buffer
+// (e.g. SOA = 2 names of up to 255 wire bytes each + 20 bytes; HIP = N rendezvous server names),
+// so it must be comfortably larger than a single max-length name (255).
+var _nameBuf = new Uint8Array(4096);
 var _nameDv = new DataView(_nameBuf.buffer);
+
+// Strict IPv4 parser shared by A / WKS / L32 encoders — fails loudly instead of
+// silently emitting garbage bytes for malformed addresses.
+function ipv4ToBytesStrict(s, rrType){
+  var str = String(s == null ? '' : s);
+  var p = str.split('.');
+  if (p.length !== 4) throw new Error(rrType + ': invalid IPv4 address "' + str + '"');
+  var out = new Uint8Array(4);
+  for (var i = 0; i < 4; i++){
+    if (!/^\d{1,3}$/.test(p[i])) throw new Error(rrType + ': invalid IPv4 address "' + str + '"');
+    var n = +p[i];
+    if (n > 255) throw new Error(rrType + ': invalid IPv4 address "' + str + '"');
+    out[i] = n;
+  }
+  return out;
+}
 
 
 // encodeName (non-compressed; suitable for RDATA and Question without compression)
@@ -73,7 +92,11 @@ function decodeName(buf, off){
     if ((len & 0xC0) !== 0) throw new Error('decodeName label type');
     if (off + len > max) throw new Error('decodeName label overflow');
 
-    labels.push(__td.decode(buf.slice(off, off+len)));
+    // subarray (no copy) + fast path for pure-ASCII labels (the overwhelming majority)
+    var seg = buf.subarray(off, off + len);
+    var isAscii = true;
+    for (var ai = 0; ai < len; ai++){ if (seg[ai] > 0x7F){ isAscii = false; break; } }
+    labels.push(isAscii ? String.fromCharCode.apply(null, seg) : __td.decode(seg));
     off += len;
   }
 
@@ -110,9 +133,7 @@ types.A.decode = function(buf, off, rdlen){
   return { value:{ address: buf[off]+'.'+buf[off+1]+'.'+buf[off+2]+'.'+buf[off+3] }, bytes:4 };
 };
 types.A.encode = function(v){
-  var p = String(v.address||'0.0.0.0').split('.');
-  var out = new Uint8Array(4);
-  out[0]=p[0]|0; out[1]=p[1]|0; out[2]=p[2]|0; out[3]=p[3]|0; return out;
+  return ipv4ToBytesStrict(v && v.address != null ? v.address : '0.0.0.0', 'A');
 };
 
 // AAAA
@@ -191,7 +212,43 @@ types.MINFO.encode = function(v){ var off=0; off=encodeName(_nameBuf,off,v.rmail
 
 // TXT — sequence of <len><bytes>
 types.TXT.decode = function(buf, off, rdlen){ var end=off+rdlen, out=[]; while(off<end){ var l=buf[off++]; if (off+l> end) throw new Error('TXT overflow'); out.push(decText(buf, off, off+l)); off+=l; } return { value:{ texts: out }, bytes: rdlen}; };
-types.TXT.encode = function(v){ var arr = Array.isArray(v.texts)? v.texts : (v.texts!=null? [v.texts] : []); var parts=new Array(arr.length), i, total=0; for(i=0;i<arr.length;i++){ var b=encText(arr[i]); parts[i]=b; total+=1+b.length; } var out=new Uint8Array(total), o=0; for(i=0;i<parts.length;i++){ var b2=parts[i]; out[o++]=b2.length&0xff; out.set(b2,o); o+=b2.length; } return out; };
+types.TXT.encode = function(v){
+  var arr = Array.isArray(v.texts) ? v.texts : (v.texts != null ? [v.texts] : []);
+  // Also accept a bare string on the data object (convenience for callers)
+  if (!arr.length && typeof v === 'string') arr = [v];
+  var parts = [], i, total = 0;
+  for (i = 0; i < arr.length; i++) {
+    var b = encText(arr[i]);
+    if (b.length <= 255) {
+      parts.push(b);
+      total += 1 + b.length;
+    } else {
+      // Split into <=255-byte chunks on UTF-8 character boundaries
+      var j = 0;
+      while (j < b.length) {
+        var end = Math.min(j + 255, b.length);
+        // If we're in the middle of a multi-byte UTF-8 sequence, back up
+        // to the start of that character.  UTF-8 continuation bytes are 10xxxxxx.
+        if (end < b.length) {
+          while (end > j && (b[end] & 0xC0) === 0x80) end--;
+          if (end === j) throw new Error('TXT: cannot split — single character > 255 bytes');
+        }
+        var chunk = b.subarray(j, end);
+        parts.push(chunk);
+        total += 1 + chunk.length;
+        j = end;
+      }
+    }
+  }
+  var out = new Uint8Array(total), o = 0;
+  for (i = 0; i < parts.length; i++) {
+    var b2 = parts[i];
+    out[o++] = b2.length;
+    out.set(b2, o);
+    o += b2.length;
+  }
+  return out;
+};
 
 // RP (RFC 1183) — mbox(NAME), txt(NAME)
 types.RP.decode = function(buf, off, rdlen){ var s=off; var m=decodeName(buf,off); off=m.off; var t=decodeName(buf,off); off=t.off; if (off-s!==rdlen) throw new Error('RP len'); return { value:{ mbox:m.name, txt:t.name }, bytes: rdlen }; };
@@ -280,7 +337,7 @@ types.KEY = {
 
 // RRSIG / SIG(obsolete)
 types.RRSIG.decode = function(buf, off, rdlen){ var s=off, dv=dvFrom(buf); var tc=readU16(dv,off); off+=2; var alg=buf[off++]; var labels=buf[off++]; var ttl=readU32(dv,off); off+=4; var exp=readU32(dv,off); off+=4; var inc=readU32(dv,off); off+=4; var keyTag=readU16(dv,off); off+=2; var n=decodeName(buf,off); off=n.off; var sig=buf.slice(off, s+rdlen); off=s+rdlen; return { value:{ typeCovered:tc, algorithm:alg, labels:labels, originalTTL:ttl, expiration:exp, inception:inc, keyTag:keyTag, signersName:n.name, signature:sig }, bytes: rdlen}; };
-types.RRSIG.encode = function(v){ var noff=encodeName(_nameBuf,0,v.signersName||'.'); var sig=v.signature||new Uint8Array(0); var out=new Uint8Array(2+1+1+4+4+4+2+noff+sig.length); var dv=new DataView(out.buffer); var o=0; o=writeU16(dv,o,v.typeCovered|0); out[o++]=v.algorithm|0; out[o++]=v.labels|0; o=writeU32(dv,o,v.originalTTL|0); o=writeU32(dv,o,v.expiration|0); o=writeU32(dv,o,v.inception|0); o=writeU16(dv,o,v.keyTag|0); out.set(_nameBuf.subarray(0,noff), o); o+=noff; out.set(sig,o); return out; };
+types.RRSIG.encode = function(v){ var noff=encodeName(_nameBuf,0,v.signersName||'.'); var sig=v.signature||new Uint8Array(0); var tcov=(typeof v.typeCovered==='string')?(type_to_code[v.typeCovered.toUpperCase()]||0):(v.typeCovered|0); var out=new Uint8Array(2+1+1+4+4+4+2+noff+sig.length); var dv=new DataView(out.buffer); var o=0; o=writeU16(dv,o,tcov); out[o++]=v.algorithm|0; out[o++]=v.labels|0; o=writeU32(dv,o,v.originalTTL|0); o=writeU32(dv,o,v.expiration|0); o=writeU32(dv,o,v.inception|0); o=writeU16(dv,o,v.keyTag|0); out.set(_nameBuf.subarray(0,noff), o); o+=noff; out.set(sig,o); return out; };
 types.SIG = types.RRSIG;
 
 // DS / CDS / DLV / TA (all same wire as DS)
@@ -312,14 +369,14 @@ function decode_alpn(u8){
   let off = 0, out = [];
   while (off < u8.length){
     const l = u8[off++]; if (l===0 || off + l > u8.length) throw new Error('alpn malformed');
-    out.push((new TextDecoder('utf-8')).decode(u8.slice(off, off+l)));
+    out.push(__td.decode(u8.subarray(off, off+l)));
     off += l;
   }
   if (off !== u8.length) throw new Error('alpn trailing bytes');
   return out; // e.g., ["h3","h2","http/1.1"]
 }
 function encode_alpn(ids){
-  const enc = new TextEncoder();
+  const enc = __te;
   const parts = ids.map(s => {
     const b = enc.encode(String(s));
     if (b.length === 0 || b.length > 255) throw new Error('alpn-id length');
@@ -392,10 +449,10 @@ function encode_mandatory(keys){
 
 function decode_dohpath(u8){
   // RFC 9461 DoH path template, UTF-8
-  return (new TextDecoder('utf-8')).decode(u8);
+  return __td.decode(u8);
 }
 function encode_dohpath(s){
-  return (new TextEncoder()).encode(String(s));
+  return __te.encode(String(s));
 }
 
 function decode_tls_supported_groups(u8){
@@ -449,7 +506,7 @@ function parseSvcParams(rawList){
       case SvcParamKeys.tlsSupportedGroups: out.tlsSupportedGroups = decode_tls_supported_groups(v); break;
       case SvcParamKeys.ohttp:
         // RFC 9540 defines ohttp param: content is an absolute/relative URI (UTF‑8). Many impls use text.
-        out.ohttp = (new TextDecoder()).decode(v); break;
+        out.ohttp = __td.decode(v); break;
       default:
         out.unknown.push({ key:k, value:v.slice(0) });
     }
@@ -470,7 +527,7 @@ function buildSvcParams(obj){
   if (obj.dohpath != null)                   res.push({ key: SvcParamKeys.dohpath,   value: encode_dohpath(obj.dohpath) });
   if (obj.tlsSupportedGroups && obj.tlsSupportedGroups.length)
                                               res.push({ key: SvcParamKeys.tlsSupportedGroups, value: encode_tls_supported_groups(obj.tlsSupportedGroups) });
-  if (obj.ohttp != null)                     res.push({ key: SvcParamKeys.ohttp,     value: (new TextEncoder()).encode(String(obj.ohttp)) });
+  if (obj.ohttp != null)                     res.push({ key: SvcParamKeys.ohttp,     value: __te.encode(String(obj.ohttp)) });
   if (obj.unknown && obj.unknown.length){
     for (const u of obj.unknown){
       res.push({ key: u.key>>>0, value: (u.value instanceof Uint8Array)? u.value.slice(0) : new Uint8Array(0) });
@@ -625,8 +682,14 @@ function decodeTypeBitmaps(buf, off, end){
   }
   return { types: typesArr, off: off };
 }
+function normalizeTypeCode(t){
+  if (typeof t === 'number') return t;
+  var c = type_to_code[String(t).toUpperCase()];
+  if (c == null) throw new Error('type bitmap: unknown RR type "' + t + '"');
+  return c;
+}
 function encodeTypeBitmaps(typeCodes){
-  typeCodes = Array.from(new Set(typeCodes)).sort(function(a,b){return a-b;});
+  typeCodes = Array.from(new Set((typeCodes || []).map(normalizeTypeCode))).sort(function(a,b){return a-b;});
   if (!typeCodes.length) return new Uint8Array(0);
   var blocks = {};
   for (var i=0;i<typeCodes.length;i++){

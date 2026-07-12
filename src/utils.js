@@ -94,11 +94,9 @@ function bytesToIpv6(bytes) {
     }
   }
   if (bestLen > 1) {
-    var rep = hextets.slice(0, bestStart).concat(['']).concat(hextets.slice(bestStart + bestLen));
-    var s = rep.join(':');
-    if (s.startsWith(':')) s = ':' + s;
-    if (s.endsWith(':')) s = s + ':';
-    return s.replace(':::', '::');
+    var head = hextets.slice(0, bestStart).join(':');
+    var tail = hextets.slice(bestStart + bestLen).join(':');
+    return head + '::' + tail; // '' + '::' + '' correctly yields '::' for the all-zero address
   }
   return hextets.join(':');
 }

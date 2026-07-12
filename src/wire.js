@@ -97,13 +97,14 @@ function encodeNameCompressed(out, off, name, dict){
     var key = suffix.toLowerCase(); // case-insensitive for compression
     if (dict.hasOwnProperty(key)){
       var ptr = dict[key];
-      if (ptr >= 0x4000) throw new Error('bad name ptr');
       out[off++] = 0xC0 | ((ptr >> 8) & 0x3F);
       out[off++] = ptr & 0xFF;
       return off;
     }
-    // record position of this suffix
-    dict[key] = off;
+    // record position of this suffix — but compression pointers can only address
+    // the first 0x4000 bytes of the message (2-bit tag + 14-bit offset), so suffixes
+    // that first appear beyond that are simply written uncompressed and never stored.
+    if (off < 0x4000) dict[key] = off;
     var lab = labels[i];
     var lb = __te.encode(lab);
     if (lb.length === 0 || lb.length > 63) throw new Error('label len');
@@ -241,7 +242,8 @@ function encodeRR(out, off, rr, dict){
 
   var impl = types[(typeof rr.type==='string')? rr.type : code_to_type[tcode]];
   if (!impl || !impl.encode) throw new Error('no encoder for type '+rr.type);
-  var rdata = impl.encode(rr.data||rr);
+  var encData = rr.data||rr;
+  var rdata = impl.encode(encData);
   dv.setUint16(off, rdata.length&0xFFFF, false); off+=2;
   out.set(rdata, off); off+=rdata.length;
   return off;
@@ -328,9 +330,26 @@ function encodeNameCanonical(out, off, name){
 // Lowercase names in RDATA for types with NAME fields (RFC 4034 §6.2)
 function canonicalizeRdataNames(rr){
   const t = typeof rr.type==='string' ? rr.type : code_to_type[rr.type];
-  const d = rr.data || rr;
-  const x = { ...d };
+  const d = rr.data != null ? rr.data : rr;
   const F = ensureFqdnLower;
+
+  // Convenience shape: NAME-based types may carry their target as a plain string
+  // (e.g. { type:'NS', data:'ns1.example.com' }). The wire encoder accepts this,
+  // so canonical (signing) encoding must interpret it identically — spreading a
+  // string would silently canonicalize the RDATA to the root name and produce a
+  // signature over the wrong bytes.
+  if (typeof d === 'string'){
+    switch (t){
+      case 'NS': case 'CNAME': case 'PTR': case 'DNAME':
+      case 'MD': case 'MF': case 'MB': case 'MG': case 'MR':
+      case 'NSAP_PTR': case 'MAILA': case 'MAILB':
+        return { name: F(d) };
+      default:
+        return d;
+    }
+  }
+
+  const x = { ...d };
 
   switch (t){
     case 'NS': case 'CNAME': case 'PTR': case 'DNAME': x.name = F(d.name); break;
@@ -388,6 +407,17 @@ function buildRRsetBytesFromAnswers(answers){
   const type0 = typeof answers[0].type==='string' ? answers[0].type.toUpperCase() : answers[0].type;
   const cls0  = answers[0].class || 'IN';
   const ttl0  = answers[0].ttl;
+
+  // An RRset is by definition records sharing the same (name, type, class).
+  // Silently coercing mixed records would produce a signature over bogus data,
+  // so mixed input is a caller error — group records by RRset before signing.
+  for (const rr of answers){
+    const t = typeof rr.type==='string' ? rr.type.toUpperCase() : rr.type;
+    if (ensureFqdnLower(rr.name) !== owner || t !== type0){
+      throw new Error('buildRRsetBytesFromAnswers: mixed RRset — expected ' + owner + '/' + type0 +
+                      ', got ' + rr.name + '/' + rr.type + '. Group answers by (name,type) first.');
+    }
+  }
 
   // canonical encoding for each RR, sorted by canonical RDATA (RFC 4034 §6)
   const items = answers.map(rr => {
@@ -457,6 +487,39 @@ function parseZone(zoneText, opts){
     var out = new Uint8Array(s.length/2);
     for (var i=0;i<out.length;i++) out[i] = parseInt(s.substr(i*2,2),16)>>>0;
     return out;
+  }
+  // Base32hex (RFC 4648 §7, "Extended Hex" alphabet 0-9 A-V) — the presentation
+  // format of NSEC3 nextHashedOwnerName in zone files (RFC 5155 §3.3).
+  function base32hexToBytes(str){
+    var s = String(str).toUpperCase().replace(/=+$/,'');
+    var alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUV';
+    var bits = 0, value = 0, out = [];
+    for (var i=0;i<s.length;i++){
+      var idx = alphabet.indexOf(s[i]);
+      if (idx === -1) throw new Error('invalid base32hex character "' + s[i] + '"');
+      value = (value << 5) | idx;
+      bits += 5;
+      if (bits >= 8){ out.push((value >>> (bits - 8)) & 0xFF); bits -= 8; }
+    }
+    return new Uint8Array(out);
+  }
+  // RRSIG expiration/inception in zone files: either seconds-since-epoch, or
+  // YYYYMMDDHHmmSS in UTC (RFC 4034 §3.2). Wire format is always epoch u32.
+  function parseSigTime(tok){
+    var s = String(tok);
+    if (/^\d{14}$/.test(s)){
+      var y = +s.slice(0,4), mo = +s.slice(4,6), d = +s.slice(6,8);
+      var h = +s.slice(8,10), mi = +s.slice(10,12), sec = +s.slice(12,14);
+      return Math.floor(Date.UTC(y, mo-1, d, h, mi, sec) / 1000) >>> 0;
+    }
+    return toU32(s);
+  }
+  function typeToken(tok){
+    var t = String(tok).toUpperCase();
+    if (type_to_code.hasOwnProperty(t)) return type_to_code[t];
+    var m = t.match(/^TYPE(\d+)$/); // RFC 3597 generic type syntax
+    if (m) return (+m[1]) & 0xFFFF;
+    return 0;
   }
   function textTokensToBytes(tokens){
     var joined = tokens.join('');
@@ -626,21 +689,21 @@ function parseZone(zoneText, opts){
         break;
       case 'RRSIG':
       case 'SIG':{
-        var typeCovered = rdtoks[0];
+        var typeCovered = typeToken(rdtoks[0]);       // numeric code, matches wire decode
         var algorithm = intArg(1);
         var labels = intArg(2);
         var originalTTL = intArg(3);
-        var expiration = toU32(rdtoks[4]);
-        var inception  = toU32(rdtoks[5]);
+        var expiration = parseSigTime(rdtoks[4]);     // supports YYYYMMDDHHmmSS and epoch
+        var inception  = parseSigTime(rdtoks[5]);
         var keyTag = intArg(6);
         var signersName = absName(rdtoks[7], state.origin);
         var signature = b64ToBytes(rdtoks.slice(8).join(''));
         rr.data = { typeCovered, algorithm, labels, originalTTL, expiration, inception, keyTag, signersName, signature };
         break;
       }
-      case 'NSEC': rr.data={ nextDomainName:nameArg(0), types:rdtoks.slice(1).map(function(x){return String(x).toUpperCase();}) }; break;
+      case 'NSEC': rr.data={ nextDomainName:nameArg(0), types:rdtoks.slice(1).map(typeToken) }; break;
       case 'NSEC3':{
-        rr.data={ hashAlgorithm:intArg(0), flags:intArg(1), iterations:intArg(2), salt:(rdtoks[3]==='-'? new Uint8Array([]) : hexToBytes(rdtoks[3])), nextHashedOwnerName:b64ToBytes(rdtoks[4]), types:rdtoks.slice(5).map(function(x){return String(x).toUpperCase();}) };
+        rr.data={ hashAlgorithm:intArg(0), flags:intArg(1), iterations:intArg(2), salt:(rdtoks[3]==='-'? new Uint8Array([]) : hexToBytes(rdtoks[3])), nextHashedOwnerName:base32hexToBytes(rdtoks[4]), types:rdtoks.slice(5).map(typeToken) };
         break;
       }
       case 'NSEC3PARAM': rr.data={ hashAlgorithm:intArg(0), flags:intArg(1), iterations:intArg(2), salt:(rdtoks[3]==='-'? new Uint8Array([]) : hexToBytes(rdtoks[3])) }; break;
