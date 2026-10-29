@@ -18,13 +18,18 @@
 
 import dgram from 'node:dgram';
 import net from 'node:net';
-import tls from 'node:tls';
+import { createQuicServer, createTcpListener } from 'quico';
+import lemonTls from 'lemon-tls';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 
 import * as wire from './wire.js';
+import { buildEDNSOptions } from './edns.js';
+import { createCookieJar } from './cookies.js';
 import { fqdn, ensureDot } from './utils.js';
-// NOTE: the QUIC transport ('quico') is loaded lazily inside startQuicServer(),
-// so it is an optional dependency — required only when options.quic is used.
+// NOTE: the encrypted transports — DoT and DoQ — both run on quico and
+// lemon-tls, so one SNICallback and one kind of certificate context serve
+// them both.
 
 
 // ---------------------------------------------------------------
@@ -157,9 +162,18 @@ function buildReq(transport, peer, buf, msg, tlsInfo){
   return req;
 }
 
+// The largest DNS message sent over UDP, whatever the client advertises.
+// A bigger datagram is fragmented at the IP layer, and fragments are dropped
+// on many paths — on IPv6 above all — so the answer never arrives and the
+// resolver times out instead of retrying over TCP. 1232 is the size every
+// path carries whole (IPv6 minimum MTU 1280, less IPv6 and UDP headers): the
+// value of DNS Flag Day 2020 and RFC 9715. An answer larger than that goes
+// out truncated (TC), and the client asks again over TCP.
+var MAX_UDP_PAYLOAD = 1232;
+
 function sanitizeEdns(ed){
   var out = {
-    udpSize: clamp(ed.udpSize || 1232, 512, 4096),
+    udpSize: clamp(ed.udpSize || MAX_UDP_PAYLOAD, 512, MAX_UDP_PAYLOAD),
     extRcode: ed.extRcode|0,
     version: ed.version|0,
     do: !!ed.do,
@@ -180,6 +194,30 @@ function sanitizeEdns(ed){
   return out;
 }
 
+// The RCODE the standards give a query before any handler sees it — 0 when
+// it is the handler's (see dispatch).
+var RCODE_FORMERR = 1, RCODE_NOTIMP = 4, RCODE_REFUSED = 5, RCODE_BADVERS = 16, RCODE_BADCOOKIE = 23;
+// The bytes of the query's COOKIE option, or null. Read raw: what makes one
+// malformed is its length (RFC 7873 §5.2.2), which the parsed form hides.
+function cookieOption(msg){
+  var opts = msg.edns && msg.edns.options;
+  if (!opts) return null;
+  for (var i = 0; i < opts.length; i++) if (opts[i] && opts[i].code === 10) return toU8(opts[i].data || new Uint8Array(0));
+  return null;
+}
+
+function standardRcode(msg){
+  if (msg.formatError) return RCODE_FORMERR;
+  if (msg.edns && (msg.edns.version | 0) !== 0) return RCODE_BADVERS;
+  // The opcode first: an unknown one is NOTIMP whatever its sections hold
+  // (RFC 8906 §8.1.4 sends opcode 15 with no question); the one-question
+  // rule is QUERY's (RFC 9619 §4).
+  if ((msg.header.opcode | 0) !== 0) return RCODE_NOTIMP;
+  var q = msg.questions && msg.questions[0];
+  if ((msg.header.qdcount | 0) !== 1 || !q || !q.name || !q.type) return RCODE_FORMERR;
+  return 0;
+}
+
 function buildRes(req, serverCtx){
   var hdrIn = req.message && req.message.header || {};
   var res = {
@@ -187,7 +225,9 @@ function buildRes(req, serverCtx){
       id: req.id|0,
       qr: true,
       opcode: hdrIn.opcode|0,
-      aa: !!serverCtx.options.always_aa,//Authoritative Answer
+      // Authoritative Answer: left undecided here so a handler can set it
+      // either way; sendResponse fills it in (see decideAA).
+      aa: undefined,
       tc: false,//Truncated
       rd: !!hdrIn.rd,//Recursion Desired
       ra: !!serverCtx.options.always_ra,//Recursion Available
@@ -198,8 +238,12 @@ function buildRes(req, serverCtx){
     answers: [],
     authority: [],
     additionals: [],
+    // The OPT RR of the answer: present when the query had one, and only then
+    // (RFC 6891 §7). Its UDP payload size is OURS — what this server takes
+    // (RFC 6891 §6.2.3) — not the client's echoed; what the answer may fill
+    // is the client's (udpLimit).
     edns: req.edns ? {
-      udpSize: req.edns.udpSize,
+      udpSize: MAX_UDP_PAYLOAD,
       extRcode: 0,
       version: 0,
       do: !!req.edns.do, // echo DO (RFC 6891 ignores it in responses, but echoing aids debugging)
@@ -230,14 +274,36 @@ function encodeNow(res, req){
   return wire.encodeMessage(msg);
 }
 
+// The address records in the additional section of a referral are its glue:
+// a resolver cannot reach the delegated servers without the in-bailiwick
+// ones. Leaving them out is a truncation (TC), not an omission (RFC 9471 §3).
+function isReferralWithGlue(res){
+  if (res.answers && res.answers.length) return false;
+  var ns = false;
+  for (var i = 0; i < (res.authority ? res.authority.length : 0); i++) if (String(res.authority[i].type).toUpperCase() === 'NS') ns = true;
+  if (!ns) return false;
+  for (var j = 0; j < (res.additionals ? res.additionals.length : 0); j++){
+    var t = String(res.additionals[j].type).toUpperCase();
+    if (t === 'A' || t === 'AAAA') return true;
+  }
+  return false;
+}
+
 function truncateSmart(serverCtx, req, res, udpMax){
   // Priority: keep OPT + answers as long as possible.
   // Sections are removed CUMULATIVELY (additionals, then also authority, then also answers) —
   // removals must stack, otherwise a message whose sections are individually too small to
   // matter can never be brought under udpMax.
+  //
+  // TC says the answer is incomplete — the client must ask again over TCP.
+  // Additional records left out are not that (RFC 2181 §9: TC is not set
+  // "merely because some extra information could have been included"),
+  // except a referral's glue (RFC 9471); anything else left out is. TC was
+  // set for every truncation, and a resolver asked again over TCP for an
+  // answer it already had whole.
   var tryOrder = ['additionals','authority','answers'];
   var saved = {};
-  res.header.tc = true;
+  var glue = isReferralWithGlue(res);
 
   var wireOut = null;
   for (var i=0;i<tryOrder.length;i++){
@@ -245,12 +311,14 @@ function truncateSmart(serverCtx, req, res, udpMax){
     if (res[sec] && res[sec].length){
       saved[sec] = res[sec];
       res[sec] = [];
+      res.header.tc = sec !== 'additionals' || glue;
       var w = encodeNow(res, req);
       if (w.length <= udpMax){ wireOut = w; break; }
     }
   }
 
   if (wireOut === null){
+    res.header.tc = true;
     // Everything stripped and still too large (huge question / tiny udpMax):
     // send header + question only, without EDNS. NEVER slice raw bytes —
     // a byte-sliced message has header counts that lie about its contents.
@@ -266,18 +334,72 @@ function truncateSmart(serverCtx, req, res, udpMax){
   return wireOut;
 }
 
-function finalizeWire(serverCtx, req, res){
-  // before encode
+function isUdp(transport){ return transport === 'udp4' || transport === 'udp6'; }
+// Transports whose bytes an observer cannot read: DoT, DoQ, and DoH through
+// handleMessage. Padding is for them alone.
+function isEncrypted(transport){ return transport === 'tls' || transport === 'quic' || transport === 'https'; }
 
-  // initial encoding
+// EDNS(0) Padding (RFC 7830, RFC 8467 §4.1): over an encrypted transport, an
+// answer's length can tell an observer what was asked — so a server pads it,
+// to a multiple of 468 octets ("Block-Length Padding", the size RFC 8467
+// recommends for responses), when the query was padded: only then (RFC 7830
+// §3: "MUST NOT" otherwise), and not over UDP or TCP in the clear. DoQ asks
+// for it in RFC 9250 §5.4. The option's 4 octets of code and length count.
+var PADDING_BLOCK = 468;
+var EDNS_OPT_PADDING = 12;
+function wantsPadding(req, res){
+  return isEncrypted(req.transport) && !!res.edns && !!req.edns &&
+         req.edns.optionsStructured && req.edns.optionsStructured.padding !== undefined;
+}
+function addPadding(res, encodedLength){
+  var opts = res.edns.options || (res.edns.options = []);
+  for (var i = 0; i < opts.length; i++) if (opts[i] && opts[i].code === EDNS_OPT_PADDING) return false;   // the handler's own
+  var pad = (PADDING_BLOCK - ((encodedLength + 4) % PADDING_BLOCK)) % PADDING_BLOCK;
+  opts.push({ code: EDNS_OPT_PADDING, data: new Uint8Array(pad) });
+  return true;
+}
+
+// EDNS options the server adds to every answer that has an OPT RR, unless
+// the handler wrote its own:
+//   COOKIE (RFC 7873 §5.2) — the client's cookie and a server cookie for it,
+//     whenever the query carried one (not with BADVERS: that answer is for an
+//     EDNS version whose options this server does not know);
+//   edns-tcp-keepalive (RFC 7828 §3.3.2) — over TCP and DoT, when the query
+//     asked: how long this server keeps an idle connection, in units of
+//     100 ms, so a client reuses it without racing the server's close.
+// Padding (above) comes after them: it is computed last (RFC 8467 §3).
+var EDNS_OPT_COOKIE = 10, EDNS_OPT_KEEPALIVE = 11;
+function hasOption(opts, code){
+  for (var i = 0; i < opts.length; i++) if (opts[i] && opts[i].code === code) return true;
+  return false;
+}
+function addServerOptions(serverCtx, req, res){
+  if (!res.edns || (res.header.rcode | 0) === RCODE_BADVERS) return;
+  var opts = res.edns.options || (res.edns.options = []);
+  var ck = req._cookie;
+  if (ck && (ck.status === 'client' || ck.status === 'valid') && serverCtx.cookies && !hasOption(opts, EDNS_OPT_COOKIE)){
+    opts.push({ code: EDNS_OPT_COOKIE, data: serverCtx.cookies.responseOption(ck) });
+  }
+  var idleMs = req._link && req._link.idleMs;
+  if (idleMs > 0 && req.edns.optionsStructured && req.edns.optionsStructured.keepalive && !hasOption(opts, EDNS_OPT_KEEPALIVE)){
+    var units = Math.min(0xFFFF, Math.round(idleMs / 100));
+    opts.push({ code: EDNS_OPT_KEEPALIVE, data: new Uint8Array([units >> 8, units & 0xFF]) });
+  }
+}
+
+function finalizeWire(serverCtx, req, res){
+  addServerOptions(serverCtx, req, res);
   var wire2 = encodeNow(res, req);
 
-  // UDP — smart truncation
-  if (req.transport === 'udp4' || req.transport === 'udp6'){
-    var udpMax = (res.edns && res.edns.udpSize) ? res.edns.udpSize : 512;
+  // UDP: no larger than the client takes (its EDNS payload size, at most
+  // ours; 512 without EDNS, RFC 1035 §4.2.1).
+  if (isUdp(req.transport)){
+    var udpMax = req.edns ? req.edns.udpSize : 512;
     if (wire2.length > udpMax){
       wire2 = truncateSmart(serverCtx, req, res, udpMax);
     }
+  } else if (wantsPadding(req, res) && addPadding(res, wire2.length)){
+    wire2 = encodeNow(res, req);
   }
   return toU8(wire2);
 }
@@ -359,6 +481,14 @@ function groupRRsets(rrs){
   return Array.from(groups.values());
 }
 
+function hasDenial(rrs){
+  for (var i = 0; i < (rrs ? rrs.length : 0); i++){
+    var t = String(rrs[i] && rrs[i].type).toUpperCase();
+    if (t === 'NSEC' || t === 'NSEC3') return true;
+  }
+  return false;
+}
+
 // Minimal async series iterator (the cache API is callback-based).
 function eachSeries(items, iter, done){
   var i = 0;
@@ -377,15 +507,28 @@ function signRRsetWithCache(ctx, material, rrset, cb){
     rrset_bytes = wire.buildRRsetBytesFromAnswers(rrset);
   } catch(e){ return cb(e); }
 
-  // DNSKEY RRsets are signed with the KSK; everything else with the ZSK.
-  var key = (typeUpper === 'DNSKEY') ? material.ksk : material.zsk;
+  // The key-set RRsets — DNSKEY, and CDS / CDNSKEY which speak for it to the
+  // parent — are signed with the KSK (RFC 7344 §4.1: by a key the current DS
+  // points at); everything else with the ZSK.
+  var keySet = (typeUpper === 'DNSKEY' || typeUpper === 'CDS' || typeUpper === 'CDNSKEY');
+  var key = keySet ? material.ksk : material.zsk;
   if (!key || !key.privateKey) return cb(null, null);
 
   var now = Math.floor(Date.now() / 1000);
-  // Validity window: taken from the key material if provided, otherwise sane
-  // defaults. The user's material object is never mutated.
+  // Validity window: taken from the key material if provided, otherwise the
+  // server's options. The user's material object is never mutated.
+  //
+  // Short by default. A signature is a proof anyone can replay until it
+  // expires: with 346 days, an answer that changed — an old address, a
+  // removed record — could be served, validly signed, for most of a year.
+  // Signing online makes short windows free; DNSKEY gets a longer one, since
+  // it changes only on a key rollover.
+  var dnssecOpt = (ctx.options && ctx.options.dnssec) || {};
+  var validity = keySet
+    ? ((dnssecOpt.dnskeyValidity  | 0) || (30 * 24 * 3600))
+    : ((dnssecOpt.signatureValidity | 0) || (7 * 24 * 3600));
   var inception  = (typeof key.inception  === 'number' && key.inception  > 0) ? key.inception  : now - 300;
-  var expiration = (typeof key.expiration === 'number' && key.expiration > 0) ? key.expiration : now + (346 * 24 * 3600);
+  var expiration = (typeof key.expiration === 'number' && key.expiration > 0) ? key.expiration : now + validity;
 
   var cacheParams = {
     name: first.name,
@@ -424,7 +567,12 @@ function signRRsetWithCache(ctx, material, rrset, cb){
 
   if (ctx._dnssecCache){
     ctx._dnssecCache.get(cacheParams, function(err, cached){
-      if (!err && cached && cached.rrsig && cached.expiration > now && cached.inception <= now){
+      // Re-signed once three quarters of its window is spent, not at the last
+      // second: a resolver caches the RRSIG with the record, and one served
+      // minutes before it expires goes bogus in that cache.
+      var fresh = cached && cached.rrsig && cached.inception <= now &&
+                  (cached.expiration - now) > (cached.expiration - cached.inception) / 4;
+      if (!err && fresh){
         cb(null, cached.rrsig);
       } else {
         try { cb(null, doSign()); } catch(e){ cb(e); }
@@ -433,6 +581,182 @@ function signRRsetWithCache(ctx, material, rrset, cb){
   } else {
     try { cb(null, doSign()); } catch(e){ cb(e); }
   }
+}
+
+// ---------------------------------------------------------------
+// Negative answers, ECS — what the standards ask beyond the handler's records
+// ---------------------------------------------------------------
+
+// RFC 9824 §2: the NXNAME meta-type, set in the NSEC of a name that does not exist.
+var TYPE_NXNAME = 128;
+// RFC 9824 §5.1: Compact Answers OK — the EDNS header flag bit after DO.
+var EDNS_FLAG_CO = 0x4000;
+var EDNS_OPT_ECS = 8;
+
+// Types claimed at a name when the handler did not say which exist (res.types).
+// Claiming a type that is absent is harmless — the resolver asks for it and
+// gets its own denial; leaving out one that exists is what breaks, since a
+// resolver may then answer "no such type" from cache (RFC 8198). So the list
+// is broad. Below the apex it never claims NS, SOA, DS, CNAME or DNAME: those
+// say "zone cut" or "alias", which would change what the name is.
+var DENIAL_FALLBACK_TYPES = ['A', 'AAAA', 'MX', 'TXT', 'CAA', 'SRV', 'HTTPS', 'SVCB', 'TLSA', 'NAPTR'];
+var DENIAL_APEX_TYPES = ['SOA', 'NS', 'DNSKEY'];
+
+function typeCode(t){
+  if (typeof t === 'number') return t;
+  return wire.type_to_code[String(t).toUpperCase()];
+}
+
+// A negative answer — nothing of the asked type (NODATA) or no such name
+// (NXDOMAIN) — must carry the zone's SOA in authority, with its TTL capped by
+// SOA.minimum (RFC 2308 §3, §5). Returns that SOA, or null when this is not a
+// negative answer (or is a referral, which carries NS instead).
+function prepareNegative(ctx, req, res, onError){
+  if (res.answers && res.answers.length) return null;
+  var rc = res.header.rcode | 0;
+  if (rc !== 0 && rc !== 3) return null;
+
+  var auth = res.authority || [];
+  var soaAt = -1, hasNS = false;
+  for (var i = 0; i < auth.length; i++){
+    var t = String(auth[i] && auth[i].type).toUpperCase();
+    if (t === 'SOA' && soaAt < 0) soaAt = i;
+    if (t === 'NS') hasNS = true;
+  }
+  if (soaAt < 0){
+    if (!hasNS) onError(new Error('negative answer for "' + req.name + '" ' + req.type +
+                                  ' has no SOA in authority (RFC 2308 §3)'), req.transport);
+    return null;
+  }
+
+  var soa = auth[soaAt];
+  var ttl = soa.ttl >>> 0;
+  var min = (soa.data && soa.data.minimum != null) ? (soa.data.minimum >>> 0) : ttl;
+  if (min < ttl){
+    // A copy: the handler's record object is not changed under it.
+    soa = { name: soa.name, type: soa.type, class: soa.class, ttl: min, data: soa.data };
+    auth[soaAt] = soa;
+  }
+  return soa;
+}
+
+// The NSEC proving a negative answer, signed online — RFC 9824 "compact
+// denial": owner is the query name, next is its immediate successor
+// (\000.<name>), so it covers nothing but this one name and the zone
+// cannot be walked. The TTL is the SOA's negative TTL (RFC 9077).
+//
+//   NODATA:  the types that DO exist at the name (res.types, or a broad
+//            fallback), never the asked one.
+//   NXDOMAIN: only NXNAME — the name does not exist.
+function buildDenialNSEC(ctx, req, res, soa, material){
+  var owner = fqdn(req.name);
+  var list;
+  if ((res.header.rcode | 0) === 3){
+    list = [TYPE_NXNAME];
+  } else if (Array.isArray(res.types)){
+    list = res.types.slice();
+  } else {
+    list = DENIAL_FALLBACK_TYPES.slice();
+    if (fqdn(soa.name) === owner) list = list.concat(DENIAL_APEX_TYPES);
+  }
+
+  // DNSKEY at the apex is answered by this library (autoAnswerIfApplicable),
+  // not by the handler, so the handler's list cannot know it is there. Left
+  // out, the apex NSEC would deny the zone's own keys — and a resolver that
+  // answers from cached NSEC (RFC 8198) would then fail to validate anything.
+  // The same goes for CDS / CDNSKEY (autoCds).
+  if ((res.header.rcode | 0) !== 3 && material && fqdn(material.signersName) === owner){
+    if (ctx.options.dnssec.autoDnskey !== false && list.indexOf('DNSKEY') < 0) list = list.concat(['DNSKEY']);
+    if (ctx.options.dnssec.autoCds !== false){
+      if (list.indexOf('CDS') < 0) list = list.concat(['CDS']);
+      if (list.indexOf('CDNSKEY') < 0) list = list.concat(['CDNSKEY']);
+    }
+  }
+
+  var asked = typeCode(req.type);
+  var codes = [];
+  for (var i = 0; i < list.length; i++){
+    var c = typeCode(list[i]);
+    if (c == null || c === asked) continue;   // unknown names are dropped, the asked type is what's denied
+    codes.push(c);
+  }
+  codes.push(typeCode('RRSIG'), typeCode('NSEC'));
+
+  return {
+    name: owner, type: 'NSEC', class: 'IN', ttl: soa.ttl,
+    data: { nextDomainName: '\u0000.' + owner, types: codes }
+  };
+}
+
+// EDNS Client Subnet in the response (RFC 7871 §7.2.1). Only when the query
+// carried ECS — never added to a response whose query had none. The scope
+// says whom the answer is good for; a resolver caches it for that subnet
+// only. Default: the source prefix the resolver sent, so the resolver asks
+// again for every other subnet and the zone's handler decides each time.
+// res.ecsScope overrides it per answer (0 = the same answer for everyone),
+// options.ecsDefaultScope (a number) overrides the default.
+function applyEcsScope(ctx, req, res, onError){
+  var ecs = req.ecs;
+  if (!ecs || !res.edns) return;
+
+  var opts = res.edns.options || (res.edns.options = []);
+  for (var i = 0; i < opts.length; i++) if (opts[i] && opts[i].code === EDNS_OPT_ECS) return; // the handler wrote its own
+
+  var src = ecs.sourcePrefixLength | 0;
+  var scope;
+  if (typeof res.ecsScope === 'number') scope = res.ecsScope;
+  else if (typeof ctx.options.ecsDefaultScope === 'number') scope = ctx.options.ecsDefaultScope;
+  else scope = src;
+  // A client that opted out (source /0) gets scope 0 (RFC 7871 §7.1.2).
+  if (src === 0) scope = 0;
+  scope = clamp(scope | 0, 0, (ecs.family === 2) ? 128 : 32);
+
+  try {
+    var built = buildEDNSOptions({ ecs: {
+      family: ecs.family, sourcePrefixLength: src, scopePrefixLength: scope, addressBytes: ecs.addressBytes
+    }});
+    for (var j = 0; j < built.length; j++) opts.push(built[j]);
+  } catch (e){
+    onError(e, req.transport);
+  }
+}
+
+// Encode the answer and hand it to the transport that brought the query
+// (see "Transports" in createServer). What a handler's answer gets on top —
+// AA, negative answers, ECS, signing — is sendResponse's; an answer the
+// server gives on its own (refuse) goes out as it is.
+function deliver(ctx, req, res, onError){
+  var wire2;
+  try {
+    wire2 = finalizeWire(ctx, req, res);
+  } catch(e){
+    onError(e, req.transport);
+    return;
+  }
+  req._link.reply(wire2, res);
+}
+
+// A query the 'accept' listener turned away. The answer says no without
+// sending anything worth forging an address for:
+//   over UDP, from an address not proven —
+//     with a client cookie: BADCOOKIE and a fresh server cookie; the client
+//       asks again at once, cookie in hand (RFC 7873 §5.2.3);
+//     without one: TC, empty; a real client asks again over TCP, which a
+//       forged address cannot complete (the "slip" of Response Rate
+//       Limiting). REFUSED would cut the forged address's real owner — often
+//       a public resolver — off this server's zones;
+//   otherwise (TCP, DoT, DoQ, DoH, or UDP with a valid cookie): REFUSED.
+function refuse(ctx, req, res){
+  res._sent = true;
+  res.header.aa = false;
+  var ck = req._cookie;
+  if (!req.addressVerified && isUdp(req.transport)){
+    if (ck && ck.status === 'client' && res.edns) res.header.rcode = RCODE_BADCOOKIE;
+    else res.header.tc = true;
+  } else {
+    res.header.rcode = RCODE_REFUSED;
+  }
+  deliver(ctx, req, res, ctx.onError);
 }
 
 function sendResponse(ctx, req, res){
@@ -445,33 +769,18 @@ function sendResponse(ctx, req, res){
   }
   res._sent = true;
 
-  function actual_send(){
-    var wire2;
-    try {
-      wire2 = finalizeWire(ctx, req, res);
-    } catch(e){
-      onError(e, req.transport);
-      return;
-    }
+  function actual_send(){ deliver(ctx, req, res, onError); }
 
-    if (req.transport === 'udp4' || req.transport === 'udp6'){
-      if (req._udp) req._udp.send(wire2, req.client.port, req.client.address);
-      return;
-    }
-    if (req.transport === 'tcp' || req.transport === 'tls'){
-      if (req._socket && !req._socket.destroyed){
-        var frame = Buffer.allocUnsafe(2 + wire2.length);
-        frame.writeUInt16BE(wire2.length, 0);
-        frame.set(wire2, 2);
-        req._socket.write(frame);
-      }
-      return;
-    }
-    if (req.transport === 'quic'){
-      if (req._quic && typeof req._quic.send === 'function') req._quic.send(wire2);
-      return;
-    }
+  // AA: an authoritative answer is one about the zone's data — NOERROR or
+  // NXDOMAIN. A REFUSED or SERVFAIL claims no authority. A handler that set
+  // res.header.aa itself is left alone.
+  if (res.header.aa === undefined){
+    var rc0 = res.header.rcode | 0;
+    res.header.aa = (ctx.options.aa !== false) && (rc0 === 0 || rc0 === 3);
   }
+
+  var negativeSOA = prepareNegative(ctx, req, res, onError);
+  applyEcsScope(ctx, req, res, onError);
 
   // If the handler already supplied RRSIGs anywhere, it is managing DNSSEC manually — don't interfere.
   var rrsig_exist = false;
@@ -500,6 +809,21 @@ function sendResponse(ctx, req, res){
       return;
     }
 
+    // Negative answer: add the NSEC that proves it (RFC 9824), unless the
+    // handler brought its own denial or turned this off (dnssec.autoDenial).
+    if (negativeSOA && ctx.options.dnssec.autoDenial !== false && !hasDenial(res.authority)){
+      res.authority.push(buildDenialNSEC(ctx, req, res, negativeSOA, material));
+      // A name that does not exist is answered NOERROR with NXNAME — what a
+      // resolver that does not know compact denial expects. One that set CO
+      // can take the NXDOMAIN back, and is told so by CO in the reply
+      // (RFC 9824 §5.1).
+      if ((res.header.rcode | 0) === 3){
+        var co = req.edns && ((req.edns.z | 0) & EDNS_FLAG_CO);
+        if (co && res.edns) res.edns.z = (res.edns.z | 0) | EDNS_FLAG_CO;
+        else res.header.rcode = 0;
+      }
+    }
+
     // Sign every RRset in answers AND authority (e.g. the SOA on negative responses).
     // Each RRset gets its own RRSIG, appended to the same section.
     var work = [];
@@ -520,56 +844,64 @@ function sendResponse(ctx, req, res){
 }
 
 
+// Key-set records the library answers itself, at the zone apex, from the
+// material keyCallback returns — they are derived from the keys, so there is
+// nothing for a handler to decide:
+//
+//   DNSKEY   the zone's public keys                       (autoDnskey)
+//   CDS      the DS the zone wants its parent to hold     (autoCds)
+//   CDNSKEY  the same, as the key itself                  (autoCds)
+//
+// CDS / CDNSKEY (RFC 7344, RFC 8078) let a parent that scans for them install
+// or update the DS without anyone typing it into a registrar's page. They
+// always match the KSK this server signs with. A parent that does not scan
+// simply never asks.
+var KEYSET_TTL = { DNSKEY: 86400, CDS: 3600, CDNSKEY: 3600 };
+
+function hexToU8(hex){
+  var out = new Uint8Array(hex.length / 2);
+  for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
 function autoAnswerIfApplicable(req, res, ctx, callback){
   try{
+    var dnssecOpt = ctx && ctx.options && ctx.options.dnssec;
+    var t = String(req.type || '').toUpperCase();
+    var wanted =
+      dnssecOpt && typeof dnssecOpt.keyCallback === 'function' &&
+      ((t === 'DNSKEY' && dnssecOpt.autoDnskey !== false) ||
+       ((t === 'CDS' || t === 'CDNSKEY') && dnssecOpt.autoCds !== false));
+    if (!wanted) return callback(false);
 
-    if(req.type === 'DNSKEY' && ctx && ctx.options && ctx.options.dnssec && typeof ctx.options.dnssec.keyCallback==='function'){
+    dnssecOpt.keyCallback(req.name, function(error, result){
 
-      ctx.options.dnssec.keyCallback(req.name,function(error,result){
+      // Only at the apex the keys belong to. A query for a subdomain goes to
+      // the handler — records owned by a name other than the qname would be
+      // a bogus answer.
+      if (!result || fqdn(result.signersName) !== fqdn(req.name)) return callback(false);
 
-        // Only auto-answer when the query name is exactly the zone the keys belong to.
-        // A DNSKEY query for e.g. a subdomain must reach the user handler — answering it
-        // with records whose owner differs from the qname would be a bogus response.
-        if(result && fqdn(result.signersName) === fqdn(req.name)){
-          if(result.ksk){
-            res.answers.push({
-              name: result.signersName,
-              type: 'DNSKEY',
-              class: 'IN',
-              ttl: 86400,
-              data: {
-                flags: 257,
-                algorithm: 13,
-                key: toU8(result.ksk.publicKey)
-              }
-            });
-          }
-          if(result.zsk){
-            res.answers.push({
-              name: result.signersName,
-              type: 'DNSKEY',
-              class: 'IN',
-              ttl: 86400,
-              data: {
-                flags: 256,
-                algorithm: 13,
-                key: toU8(result.zsk.publicKey)
-              }
-            });
-          }
-          
-          res.send();
+      var owner = result.signersName;
+      var ttl = KEYSET_TTL[t];
 
-          callback(true);
-        }else{
-          callback(false);
-        }
+      if (t === 'DNSKEY'){
+        if (result.ksk) res.answers.push({ name: owner, type: 'DNSKEY', class: 'IN', ttl: ttl,
+          data: { flags: 257, algorithm: 13, key: toU8(result.ksk.publicKey) } });
+        if (result.zsk) res.answers.push({ name: owner, type: 'DNSKEY', class: 'IN', ttl: ttl,
+          data: { flags: 256, algorithm: 13, key: toU8(result.zsk.publicKey) } });
+      } else if (t === 'CDNSKEY'){
+        if (result.ksk) res.answers.push({ name: owner, type: 'CDNSKEY', class: 'IN', ttl: ttl,
+          data: { flags: 257, algorithm: 13, key: toU8(result.ksk.publicKey) } });
+      } else if (t === 'CDS'){
+        if (result.ksk && result.ksk.digest) res.answers.push({ name: owner, type: 'CDS', class: 'IN', ttl: ttl,
+          data: { keyTag: result.ksk.keyTag, algorithm: result.ksk.algorithm || 13,
+                  digestType: result.ksk.digestType || 2, digest: hexToU8(result.ksk.digest) } });
+      }
 
-      });
-
-    }else{
-      callback(false);
-    }
+      if (!res.answers.length) return callback(false);
+      res.send();
+      callback(true);
+    });
 
   }catch(e){
     callback(false);
@@ -580,106 +912,171 @@ function autoAnswerIfApplicable(req, res, ctx, callback){
 // ---------------------------------------------------------------
 // DNS over QUIC — RFC 9250
 // ---------------------------------------------------------------
-function startQuicServer(serverCtx, quicOpt, handler){
-  var onError = typeof serverCtx.options.onError === 'function'
-    ? serverCtx.options.onError
-    : function(){};
+//
+// One query per client-initiated bidirectional stream, its 2-octet length
+// first, the stream finished after it (§4.2); one response on the same
+// stream, finished after it. The DNS message itself takes the path every
+// transport's does (serverCtx._receive): FORMERR, BADVERS, NOTIMP, the
+// handler.
+//
+// What only DoQ forbids is a protocol error, fatal to the connection: closed
+// with DOQ_PROTOCOL_ERROR (§4.3.3: "SHOULD forcibly abort the connection
+// using QUIC's CONNECTION_CLOSE mechanism and SHOULD use the DoQ error code
+// DOQ_PROTOCOL_ERROR"):
+//   a Message ID other than 0 (§4.2.1),
+//   the edns-tcp-keepalive option (§5.5.2) — QUIC keeps the connection,
+//   a stream finished before the whole message has come,
+//   more than one message on a stream, or bytes after it,
+//   a unidirectional stream from the client.
+// A query is handled as soon as it is whole, without waiting for the
+// client's FIN (§4.2: "SHOULD process queries as they arrive").
+// A client that gives a query up (§4.3.1): STOP_SENDING cancels it (QUIC
+// resets the stream; the answer, if it comes, goes nowhere); RESET_STREAM
+// before its FIN cancels it too, and the server resets its side with
+// DOQ_REQUEST_CANCELLED — unless the answer and its FIN have already gone.
+var DOQ_PROTOCOL_ERROR = 0x2, DOQ_REQUEST_CANCELLED = 0x3, DOQ_EXCESSIVE_LOAD = 0x4;
+var DNS_MESSAGE_MAX = 65535;
+var DOQ_TICKET_LIFETIME = 6 * 3600;   // seconds
 
-  // 'quico' is an optional dependency: loaded only when QUIC is actually enabled,
-  // so users who don't need DoQ don't need the package installed.
-  import('quico').then(function(mod){
-    startQuicServerWith(mod.createQuicServer, serverCtx, quicOpt, handler, onError);
-  }).catch(function(err){
-    onError(new Error("DNS-over-QUIC requires the optional 'quico' package (npm i quico): " + err.message), 'quic');
-  });
-}
-
-function startQuicServerWith(createQuicServer, serverCtx, quicOpt, handler, onError){
+function startQuicServer(serverCtx, quicOpt, onError){
   var quicSrv = createQuicServer({
     alpn:           quicOpt.alpn           || ['doq'],
     key:            quicOpt.key,
     cert:           quicOpt.cert,
     ca:             quicOpt.ca             || undefined,
     SNICallback:    quicOpt.SNICallback    || undefined,
-    maxConnections: quicOpt.maxConnections || 10000
+    maxConnections: quicOpt.maxConnections || 10000,
+    // Session tickets good for 6 hours, the lifetime RFC 9250 §5.5.3
+    // suggests ("e.g., 6 hours"): a resolver that comes back within it
+    // resumes instead of a full handshake. lemon-tls's own default is 2.
+    sessionTimeout: quicOpt.sessionTimeout != null ? quicOpt.sessionTimeout : DOQ_TICKET_LIFETIME
   });
 
   quicSrv.on('error', function(err){ onError(err, 'quic'); });
 
   quicSrv.on('connection', function(quic, peer){
-
-    // Per-connection buffer: one Uint8Array accumulator per stream id.
-    // Both the number of concurrently-open (un-FINed) streams and the bytes
-    // buffered per stream are capped — a hostile client opening streams it
-    // never finishes must not accumulate memory for the connection's lifetime.
-    var streamBufs = {};
-    var openStreams = 0;
+    // Per stream: the query's bytes as they come. Bounded by count (QUIC's
+    // stream limit bounds it too; this is the server's own) and by size:
+    // a message is at most 65535 octets, its length prefix says how many.
+    var streams = new Map();
     var MAX_OPEN_STREAMS = (quicOpt.maxOpenStreams|0) || 100;
-    var MAX_STREAM_BYTES = 2 + 65535; // DoQ: one length-prefixed DNS message per stream
+    var closed = false;
+    var tlsInfo = { alpn: 'doq' };
+
+    function fail(code, why){
+      if (closed) return;
+      closed = true;
+      streams.clear();
+      try { quic.close(code, why, true); } catch (e){}
+    }
+
+    // Per stream: { parts, total, declared, query, answered, finSeen, cancelled }
+    //   query     the message is whole and has gone to dispatch
+    //   answered  its answer has gone, with the stream's FIN
+    //   finSeen   the client's FIN has come
+    //   cancelled the client gave the query up; nothing more is sent
+    // A stream is forgotten once both sides are over: answered (or
+    // cancelled) and the client's FIN or reset has come.
+    function settle(sid, st){
+      if ((st.answered || st.cancelled) && st.finSeen) streams.delete(sid);
+    }
+
+    // The query, handled as soon as it is whole — §4.2: "Servers SHOULD
+    // process queries as they arrive". It used to wait for the client's FIN,
+    // and a client that sends the FIN in a frame of its own waited for it.
+    function handleQuery(sid, st){
+      st.query = true;
+      var full = st.parts.length === 1 ? st.parts[0] : Buffer.concat(st.parts, st.total);
+      st.parts = null;
+      var body = toU8(full).subarray(2, 2 + st.declared);
+      // §4.2.1: the Message ID is 0 on DoQ.
+      if (body.length >= 2 && (body[0] !== 0 || body[1] !== 0)) return fail(DOQ_PROTOCOL_ERROR, 'DoQ: a Message ID other than 0');
+
+      var reply = function(w){
+        if (closed || st.cancelled || st.answered) return;
+        var frame = new Uint8Array(2 + w.length);
+        frame[0] = (w.length >> 8) & 0xFF;
+        frame[1] = w.length & 0xFF;
+        frame.set(w, 2);
+        st.answered = true;
+        settle(sid, st);
+        try { quic.sendStream(sid, frame, true); } catch (e){ onError(e, 'quic'); }   // FIN: the one answer
+      };
+      serverCtx._receive(body, 'quic', peer, { reply: reply, tls: tlsInfo }, function(msg){
+        // §5.5.2 / §4.3.3: edns-tcp-keepalive is a protocol error on DoQ.
+        var ka = msg.edns && msg.edns.optionsStructured && msg.edns.optionsStructured.keepalive;
+        if (ka){ fail(DOQ_PROTOCOL_ERROR, 'DoQ: the edns-tcp-keepalive option'); return false; }
+        return true;
+      });
+    }
 
     quic.on('stream', function(streamId, chunk, fin){
-      // Accumulate chunks — DoQ sends one DNS query per bidi stream.
-      if (!streamBufs[streamId]){
-        if (openStreams >= MAX_OPEN_STREAMS){ if (quic.close) quic.close(); return; }
-        streamBufs[streamId] = { parts: [], total: 0 };
-        openStreams++;
+      if (closed) return;
+      var sid = Number(streamId);
+      if (sid & 0x2) return fail(DOQ_PROTOCOL_ERROR, 'DoQ: a unidirectional stream');   // §4.3.3
+      var st = streams.get(sid);
+      if (!st){
+        if (streams.size >= MAX_OPEN_STREAMS) return fail(DOQ_EXCESSIVE_LOAD, 'DoQ: too many queries at once');
+        st = { parts: [], total: 0, declared: -1, query: false, answered: false, finSeen: false, cancelled: false };
+        streams.set(sid, st);
       }
-      var sb = streamBufs[streamId];
-      if (chunk && chunk.byteLength > 0){
-        sb.total += chunk.byteLength;
-        if (sb.total > MAX_STREAM_BYTES){ delete streamBufs[streamId]; openStreams--; return; }
-        sb.parts.push(chunk);
-      }
-      if (!fin) return;
-
-      // Reassemble and remove buffer entry.
-      var parts = sb.parts;
-      delete streamBufs[streamId];
-      openStreams--;
-
-      var total = 0;
-      for (var i = 0; i < parts.length; i++) total += parts[i].byteLength;
-      var full = new Uint8Array(total);
-      var off  = 0;
-      for (var i = 0; i < parts.length; i++){ full.set(parts[i], off); off += parts[i].byteLength; }
-
-      // DoQ framing: 2-byte big-endian length prefix (RFC 9250 §4.2).
-      if (full.byteLength < 2) return;
-      var msgLen = (full[0] << 8) | full[1];
-      var body   = full.subarray(2, 2 + msgLen);
-      if (body.byteLength < msgLen) return; // truncated — drop
-
-      var msg;
-      try { msg = wire.decodeMessage(body); } catch(e){ return; }
-
-      // Capture streamId in closure for the send callback below.
-      var sid = streamId;
-      var sendHandle = {
-        send: function(data){
-          // DoQ response: 2-byte length prefix + DNS wire bytes (RFC 9250 §4.2).
-          var frame = new Uint8Array(2 + data.length);
-          frame[0] = (data.length >> 8) & 0xFF;
-          frame[1] =  data.length       & 0xFF;
-          frame.set(data, 2);
-          quic.sendStream(sid, frame, true); // fin=true — one query per stream
+      var n = chunk ? chunk.byteLength : 0;
+      if (n > 0 && !st.cancelled){
+        // Anything after a whole message is a second one (§4.3.3).
+        if (st.query) return fail(DOQ_PROTOCOL_ERROR, 'DoQ: more than one message on a stream');
+        st.total += n;
+        if (st.total > 2 + DNS_MESSAGE_MAX) return fail(DOQ_PROTOCOL_ERROR, 'DoQ: more than one message on a stream');
+        st.parts.push(chunk);
+        // As soon as the length is known: no more than it says.
+        if (st.declared < 0 && st.total >= 2){
+          var head = st.parts.length === 1 ? st.parts[0] : Buffer.concat(st.parts, st.total);
+          st.parts = [head];
+          st.declared = (head[0] << 8) | head[1];
         }
-      };
+        if (st.declared >= 0 && st.total > 2 + st.declared) return fail(DOQ_PROTOCOL_ERROR, 'DoQ: bytes after the message on a stream');
+      }
+      if (fin) st.finSeen = true;
+      if (!st.query && !st.cancelled && st.declared >= 0 && st.total === 2 + st.declared){
+        handleQuery(sid, st);
+        if (closed) return;
+      }
+      if (fin && !st.query && !st.cancelled) return fail(DOQ_PROTOCOL_ERROR, 'DoQ: the stream finished before its message');
+      if (fin) settle(sid, st);
+    });
 
-      var req = buildReq('quic', peer, body, msg, { alpn: 'doq' });
-      req._quic = sendHandle;
-
-      var res = buildRes(req, serverCtx);
-
-      autoAnswerIfApplicable(req, res, serverCtx, function(is_sent){
-        if (is_sent === false) handler(req, res);
-      });
+    // The client gave the query up (§4.3.1).
+    // STOP_SENDING: QUIC itself answers it with RESET_STREAM (RFC 9000 §3.5).
+    // The query is cancelled: its answer, if one comes later, is not sent.
+    // RESET_STREAM before the client's FIN: the transaction is abandoned, and
+    // the server "MUST issue a RESET_STREAM ... unless ... it has already
+    // both sent the response and indicated the STREAM FIN". That holds for a
+    // stream the server has seen no byte of, too — a reset can come before
+    // any data, or with it lost. (It was answered only for a stream with
+    // data already in; a scanner resetting a fresh stream got nothing back.)
+    // A reset after the client's FIN is no reset at all: QUIC drops it.
+    quic.on('stop_sending', function(sid){
+      sid = Number(sid);
+      var st = streams.get(sid);
+      if (!st) return;
+      st.cancelled = true;
+      st.parts = null;
+      settle(sid, st);
+    });
+    quic.on('stream_reset', function(sid){
+      if (closed) return;
+      sid = Number(sid);
+      if (sid & 0x2) return;
+      var st = streams.get(sid);
+      streams.delete(sid);
+      if (st && st.answered) return;
+      if (st) { st.cancelled = true; st.parts = null; }
+      try { quic.resetStream(sid, DOQ_REQUEST_CANCELLED); } catch (e){}
     });
 
     quic.on('close', function(){
-      streamBufs = {};
-      openStreams = 0;
+      closed = true;
+      streams.clear();
     });
-
   });
 
   quicSrv.listen(
@@ -698,7 +1095,12 @@ function createServer(options, handler){
   options = options || {};
 
   // behavioral flags
-    if (!options.always_aa) options.always_aa = true;
+  //   aa  (default true)  — this is an authoritative server: answers carry AA
+  //                         (RFC 1035 §4.1.1). false leaves it off unless a
+  //                         handler sets res.header.aa itself.
+  //   always_ra (default false)
+  // The old `always_aa` could not be turned off — `if (!options.always_aa)`
+  // set it back to true whenever it was false.
     if (!options.always_ra) options.always_ra = false;
 
   var onError = typeof options.onError === 'function' ? options.onError : function(){};
@@ -706,9 +1108,14 @@ function createServer(options, handler){
   // default transport options
   var udpOpt = options.udp===false ? null : (options.udp || { udp4:{ host:'0.0.0.0', port:53 }, udp6:{ host:'::', port:53 } });
   if (udpOpt && (!udpOpt.udp4 && !udpOpt.udp6)){
-    var uhost = udpOpt.host||'0.0.0.0';
+    // { port, host }: a host binds the one socket of its family — '127.0.0.1'
+    // must not also open '::' (every IPv6 interface); no host binds both.
     var uport = (udpOpt.port == null) ? 53 : (udpOpt.port|0);
-    udpOpt = { udp4:{ host:uhost, port:uport }, udp6:{ host:'::', port:uport } };
+    var ufam = udpOpt.host ? net.isIP(udpOpt.host) : 0;
+    if (udpOpt.host && !ufam) throw new TypeError('udp.host must be an IP address: ' + JSON.stringify(udpOpt.host));
+    udpOpt = ufam === 4 ? { udp4:{ host:udpOpt.host, port:uport } }
+           : ufam === 6 ? { udp6:{ host:udpOpt.host, port:uport } }
+           : { udp4:{ host:'0.0.0.0', port:uport }, udp6:{ host:'::', port:uport } };
   }
 
   var tcpOpt = options.tcp===false ? null : (options.tcp || { host:'::', port:53, idleMs:30000 });
@@ -749,7 +1156,14 @@ function createServer(options, handler){
     }
   }
 
+  // The object createServer returns. Its 'accept' event asks, for every
+  // query, whether to answer it at all (see dispatch).
+  var server = new EventEmitter();
+
   var serverCtx = {
+    server: server,
+    cookies: createCookieJar(options.cookies, crypto.randomBytes),
+    onError: onError,
     udp4: null, 
     udp6: null, 
     tcp: null, 
@@ -762,85 +1176,114 @@ function createServer(options, handler){
     _dnssecCache: dnssecCache
   };
 
-  function earlyGuardsAndMaybeHandle(msg, transport, peer, rawBuf, socket, tlsInfo){
-    // basic validity checks before passing to handler
-    var qd = msg && msg.header ? (msg.header.qdcount|0) : 0;
-    var opcode = msg && msg.header ? (msg.header.opcode|0) : 0;
-
-    // EDNS BADVERS
-    if (msg && msg.edns && (msg.edns.version|0) !== 0){
-      var req = buildReq(transport, peer, rawBuf, msg, tlsInfo);
-      var res = buildRes(req, serverCtx);
-      res.header.rcode = 0; // MUST be 0, error goes in extRcode
-      res.edns = res.edns || { udpSize: clamp( (req.edns&&req.edns.udpSize)||1232, 512, 4096 ), extRcode:16, version:0, do:false, z:0, options:[] };
-      res.edns.extRcode = 16; // BADVERS
-      // send immediately
-      req._udp = (transport==='udp4'||transport==='udp6') ? socket : undefined;
-      req._socket = (transport==='tcp'||transport==='tls') ? socket : undefined;
-      return sendResponse(serverCtx, req, res);
-    }
-
-    if (qd < 1){
-      var req0 = buildReq(transport, peer, rawBuf, msg, tlsInfo);
-      var res0 = buildRes(req0, serverCtx);
-      res0.header.rcode = 1; // FORMERR
-      req0._udp = (transport==='udp4'||transport==='udp6') ? socket : undefined;
-      req0._socket = (transport==='tcp'||transport==='tls') ? socket : undefined;
-      return sendResponse(serverCtx, req0, res0);
-    }
-
-    if (!msg.questions || !msg.questions[0] || !msg.questions[0].name || !msg.questions[0].type) {
-      var reqQ = buildReq(transport, peer, rawBuf, msg, tlsInfo);
-      var resQ = buildRes(reqQ, serverCtx);
-      resQ.header.rcode = 1; // FORMERR
-      reqQ._udp = (transport==='udp4'||transport==='udp6') ? socket : undefined;
-      reqQ._socket = (transport==='tcp'||transport==='tls') ? socket : undefined;
-      return sendResponse(serverCtx, reqQ, resQ);
-    }
-
-    if (opcode !== 0){
-      var req1 = buildReq(transport, peer, rawBuf, msg, tlsInfo);
-      var res1 = buildRes(req1, serverCtx);
-      res1.header.rcode = 4; // NOTIMP
-      req1._udp = (transport==='udp4'||transport==='udp6') ? socket : undefined;
-      req1._socket = (transport==='tcp'||transport==='tls') ? socket : undefined;
-      return sendResponse(serverCtx, req1, res1);
-    }
-
-    // valid — pass to handler
-    var req = buildReq(transport, peer, rawBuf, msg, tlsInfo);
-    if (transport==='udp4' || transport==='udp6'){
-      req._udp = socket;
-    }else{
-      req._socket = socket;
-    }
+  // One path for every query, whatever carried it. `link` is what the
+  // transport brings with it:
+  //   reply(wireBytes, res)  how the answer goes back (see "Transports")
+  //   tls                    { authorized, alpn } on DoT / DoQ (req.tls)
+  //   idleMs                 TCP / DoT: how long an idle connection is kept
+  // The transport's name decides the rest (truncation over UDP, padding over
+  // an encrypted one).
+  //
+  // In order:
+  //   a message with QR set — a response — is never answered: two servers
+  //     could otherwise answer each other's answers forever (RFC 1035 §4.1.1;
+  //     RFC 8906 §3.1.4);
+  //   its COOKIE is checked (RFC 7873): req.addressVerified says whether the
+  //     source address is proven — by a handshake (TCP, DoT, DoQ, DoH) or by
+  //     a valid server cookie (UDP);
+  //   'accept' — whether to answer at all. Before anything the server would
+  //     answer on its own, so the DNSKEY of a zone, the classic reflection
+  //     answer, is weighed like any other;
+  //   what the standards answer themselves:
+  //     FORMERR for a malformed OPT RR (RFC 6891 §6.1.1) or COOKIE (RFC 7873
+  //       §5.2.2), and for anything but exactly one question (RFC 9619);
+  //     BADVERS for an EDNS version other than 0 (RFC 6891 §6.1.3);
+  //     NOTIMP for an opcode other than QUERY (RFC 8906 §3.1.4);
+  //   the key sets (autoAnswerIfApplicable); then the handler.
+  function dispatch(msg, transport, peer, rawBuf, link){
+    if (msg.header.qr) return;
+    var req = buildReq(transport, peer, rawBuf, msg, link.tls);
+    req._link = link;
+    req._cookie = serverCtx.cookies ? serverCtx.cookies.inspect(cookieOption(msg), peer.address) : { status: 'none' };
+    req.addressVerified = !isUdp(transport) || req._cookie.status === 'valid';
     var res = buildRes(req, serverCtx);
 
-
-    autoAnswerIfApplicable(req, res, serverCtx,function(is_sent){
-      if(is_sent===false){
-        return handler(req, res);
-      }
+    if (server.listenerCount('accept') === 0) return answer(req, res);
+    var decided = false;
+    server.emit('accept', req, function(ok){
+      if (decided) return;
+      decided = true;
+      if (ok) answer(req, res);
+      else refuse(serverCtx, req, res);
     });
-    
+  }
+  function answer(req, res){
+    var rcode = standardRcode(req.message) || (req._cookie.status === 'malformed' ? RCODE_FORMERR : 0);
+    if (rcode !== 0){
+      res.header.rcode = rcode;
+      return sendResponse(serverCtx, req, res);
+    }
+    autoAnswerIfApplicable(req, res, serverCtx, function(is_sent){
+      if (is_sent === false) handler(req, res);
+    });
+  }
+
+  // A message that does not decode: FORMERR from its header alone, when it
+  // has one and is a query (RFC 1035 §4.1.1) — or null: nothing to answer.
+  function formerrFor(raw){
+    if (!raw || raw.length < 12 || (raw[2] & 0x80)) return null;
+    try {
+      return toU8(wire.encodeMessage({
+        header: { id: (raw[0] << 8) | raw[1], qr: true, opcode: (raw[2] >> 3) & 0xF, rd: !!(raw[2] & 1), rcode: 1 },
+        questions: [], answers: [], authority: [], additionals: []
+      }));
+    } catch (e){ return null; }
+  }
+
+  // Bytes from a transport: decoded and dispatched — or, undecodable,
+  // answered FORMERR.
+  // check(msg), optional: a transport's own rules (DoQ's) — false stops
+  // the message there.
+  function receive(raw, transport, peer, link, check){
+    var u8 = toU8(raw), msg;
+    try { msg = wire.decodeMessage(u8); }
+    catch (e){
+      var fe = formerrFor(u8);
+      if (fe) link.reply(fe, null);
+      return;
+    }
+    if (check && check(msg) === false) return;
+    dispatch(msg, transport, peer, u8, link);
+  }
+  serverCtx._receive = receive;
+  serverCtx._dispatch = dispatch;
+  serverCtx._formerrFor = formerrFor;
+
+  // ---- Transports ----
+  //
+  // Each delivers an answer its own way: a datagram back to the sender over
+  // UDP; length-prefixed on the connection over TCP and TLS (RFC 1035
+  // §4.2.2, RFC 7858 §3.3); on the query's own stream over QUIC (DoQ below);
+  // handed back to the caller for DoH (handleMessage).
+  function udpReply(socket, peer){
+    return function(w){ socket.send(w, peer.port, peer.address); };
+  }
+  function streamReply(socket){
+    return function(w){
+      if (socket.destroyed) return;
+      var frame = Buffer.allocUnsafe(2 + w.length);
+      frame.writeUInt16BE(w.length, 0);
+      frame.set(w, 2);
+      socket.write(frame);
+    };
   }
 
   // --- UDP4 ---
   if (udpOpt && udpOpt.udp4){
     var u4 = dgram.createSocket('udp4');
     u4.on('message', function(buf, rinfo){
-      try {
-        var u8 = toU8(buf);
-        var msg = wire.decodeMessage(u8);
-        earlyGuardsAndMaybeHandle(msg, 'udp4', { address:rinfo.address, port:rinfo.port }, u8, u4, null);
-      } catch (e){
-        try {
-          var dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-          var id = dv.getUint16(0, false);
-          var errWire = wire.encodeMessage({ header:{ id:id, qr:true, rcode:1, qdcount:0, ancount:0, nscount:0, arcount:0 }, questions:[], answers:[], authority:[], additionals:[] });
-          u4.send(toU8(errWire), rinfo.port, rinfo.address);
-        } catch(_e){}
-      }
+      var peer = { address: rinfo.address, port: rinfo.port };
+      receive(buf, 'udp4', peer, { reply: udpReply(u4, peer) });
     });
     u4.on('error', function(err){ onError(err, 'udp4'); });
     u4.bind((udpOpt.udp4.port|0)||53, udpOpt.udp4.host||'0.0.0.0');
@@ -851,18 +1294,8 @@ function createServer(options, handler){
   if (udpOpt && udpOpt.udp6){
     var u6 = dgram.createSocket({type: 'udp6', ipv6Only: true});
     u6.on('message', function(buf, rinfo){
-      try {
-        var u8 = toU8(buf);
-        var msg = wire.decodeMessage(u8);
-        earlyGuardsAndMaybeHandle(msg, 'udp6', { address:rinfo.address, port:rinfo.port }, u8, u6, null);
-      } catch (e){
-        try {
-          var dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-          var id = dv.getUint16(0, false);
-          var errWire = wire.encodeMessage({ header:{ id:id, qr:true, rcode:1, qdcount:0, ancount:0, nscount:0, arcount:0 }, questions:[], answers:[], authority:[], additionals:[] });
-          u6.send(toU8(errWire), rinfo.port, rinfo.address);
-        } catch(_e){}
-      }
+      var peer = { address: rinfo.address, port: rinfo.port };
+      receive(buf, 'udp6', peer, { reply: udpReply(u6, peer) });
     });
     u6.on('error', function(err){ onError(err, 'udp6'); });
     u6.bind((udpOpt.udp6.port|0)||53, udpOpt.udp6.host||'::');
@@ -882,6 +1315,31 @@ function createServer(options, handler){
   function handleStreamSocket(socket, transport, idleMs){
     var chunks = [];
     var totalLen = 0;
+    var peer = { address: socket.remoteAddress, port: socket.remotePort };
+
+    // The idle timeout (default 30 s) counts from the last whole message,
+    // either way — a query in, or an answer out — not from any byte (RFC 7766
+    // §6.2.3): a client trickling a message a byte at a time would otherwise
+    // hold the connection for ever. It is also what edns-tcp-keepalive tells
+    // a client that asks (RFC 7828).
+    var effectiveIdle = (idleMs != null && idleMs > 0) ? idleMs : 30000;
+    var idleTimer = setTimeout(function(){ socket.destroy(); }, effectiveIdle);
+    socket.on('close', function(){ clearTimeout(idleTimer); });
+
+    var write = streamReply(socket);
+    var link = {
+      reply: function(w, res){ idleTimer.refresh(); write(w, res); },
+      tls: (transport === 'tls') ? { authorized: !!socket.authorized, alpn: socket.alpnProtocol } : null,
+      idleMs: effectiveIdle
+    };
+
+    // Nagle off (TCP_NODELAY). Resolvers pipeline queries over one connection
+    // (RFC 7766 §6.2.1.1) and each answer is written as it is ready; with
+    // Nagle on, an answer written while the previous one is unacknowledged
+    // waits for the ACK — up to a round trip, plus the client's delayed-ACK
+    // timer. A TLS socket (DoT) passes it down to its TCP socket; quico's
+    // listener already sets it there.
+    if (typeof socket.setNoDelay === 'function') socket.setNoDelay(true);
 
     serverCtx._streamSockets.add(socket);
     socket.on('close', function(){ serverCtx._streamSockets.delete(socket); });
@@ -900,12 +1358,12 @@ function createServer(options, handler){
         if (buf.length < 2 + msgLen) break;
         var body = buf.subarray(2, 2 + msgLen);
         buf = buf.subarray(2 + msgLen);
-        try {
-          var u8 = toU8(body);
-          var msg = wire.decodeMessage(u8);
-          var tlsInfo = (transport === 'tls') ? { authorized: !!socket.authorized, alpn: socket.alpnProtocol } : null;
-          earlyGuardsAndMaybeHandle(msg, transport, { address: socket.remoteAddress, port: socket.remotePort }, u8, socket, tlsInfo);
-        } catch(e){ socket.destroy(); return; }
+        // A message that does not decode is answered FORMERR, and the
+        // connection goes on: its framing is intact (RFC 7766 §8). It was
+        // closed, every query pipelined behind it with it.
+        idleTimer.refresh();
+        receive(body, transport, peer, link);
+        if (socket.destroyed) return;
       }
 
       // keep only the unparsed remainder — chunks is reset so consumed
@@ -919,10 +1377,6 @@ function createServer(options, handler){
       }
     });
 
-    // Idle timeout ALWAYS applies (default 30s). Without it, lazy or hostile
-    // clients hold sockets (and their buffers) open indefinitely.
-    var effectiveIdle = (idleMs != null && idleMs > 0) ? idleMs : 30000;
-    socket.setTimeout(effectiveIdle, function(){ socket.destroy(); });
     socket.on('error', function(err){ onError(err, transport); });
   }
 
@@ -941,22 +1395,86 @@ function createServer(options, handler){
   }
 
   // --- TLS (DoT) ---
+  //
+  // On quico's TCP listener and lemon-tls, the same stack as DoQ. It ran on
+  // node:tls before, which broke it for every client: node:tls cannot use a
+  // lemon-tls context (the handshake ended in EOF), and never calls the
+  // SNICallback when the client sends no name (internal_error). DNS clients
+  // are usually configured by IP, and an IP is never sent as SNI (RFC 6066
+  // §3), so that second case is the common one here. lemon-tls resolves every
+  // certificate through the callback, SNI or not, and the listener passes the
+  // connection's local address as a third argument.
   if (tlsOpt){
-    if (!('ALPNProtocols' in tlsOpt)) tlsOpt.ALPNProtocols = ['dot'];
-    var tlsSrv = tls.createServer(tlsOpt, function(socket){
-      handleStreamSocket(socket, 'tls', tlsOpt.idleMs || 0);
+    var dot = createTcpListener({
+      tls: lemonTls,
+      key: tlsOpt.key, cert: tlsOpt.cert, ca: tlsOpt.ca,
+      SNICallback: tlsOpt.SNICallback
     });
-    tlsSrv.on('error', function(err){ onError(err, 'tls'); }); // bind errors must not crash the process
-    if (tlsOpt.maxConnections > 0) tlsSrv.maxConnections = tlsOpt.maxConnections|0;
-    tlsSrv.listen((tlsOpt.port|0) || 853, tlsOpt.host || '::');
-    serverCtx.tls = tlsSrv;
+
+    // node:net's maxConnections has no equivalent on the listener; the cap is
+    // applied as each connection completes its handshake.
+    var dotMax = tlsOpt.maxConnections > 0 ? tlsOpt.maxConnections|0 : 0;
+    var onDot = function(socket){
+      if (dotMax && dot.connections > dotMax){ socket.destroy(); return; }
+      handleStreamSocket(socket, 'tls', tlsOpt.idleMs || 0);
+    };
+
+    // Registration order is the ALPN preference order.
+    var dotAlpns = tlsOpt.ALPNProtocols || ['dot'];
+    for (var ai = 0; ai < dotAlpns.length; ai++) dot.register(dotAlpns[ai], onDot);
+
+    dot.on('error', function(err){ onError(err, 'tls'); });   // bind errors must not crash the process
+    // A failed handshake is the client's problem. Scanners probing the address
+    // arrive continuously and would otherwise flood onError.
+    dot.on('clientError', function(){});
+
+    dot.listen((tlsOpt.port|0) || 853, tlsOpt.host || '::');
+    serverCtx.tls = dot;
   }
 
-  // --- QUIC (stub) ---
-  if (quicOpt){ startQuicServer(serverCtx, quicOpt, handler); }
+  // --- QUIC (DoQ) ---
+  if (quicOpt){ startQuicServer(serverCtx, quicOpt, onError); }
 
-  // return minimal control object (e.g. for shutdown)
-  return {
+  // One DNS message from a transport the application runs itself — DNS over
+  // HTTPS (RFC 8484) behind its own HTTP server. The query takes the same path
+  // as one over UDP or TCP: the auto-answered key sets, the handler, and what
+  // res.send() completes. The library serves no HTTP; the caller extracts the
+  // message (GET ?dns=, base64url / POST body) and returns the reply bytes as
+  // application/dns-message.
+  //
+  //   cb(err, responseBytes, { ttl })
+  //     err   the bytes are not a DNS message — answer HTTP 400
+  //     ttl   the smallest TTL in the response, for Cache-Control max-age
+  //           (RFC 8484 §5.1); undefined when it carries no records
+  function handleMessage(bytes, peer, cb){
+    peer = peer || {};
+    var u8, msg;
+    try {
+      u8 = toU8(bytes);
+      msg = wire.decodeMessage(u8);
+    } catch (e){
+      return cb(e);
+    }
+    // A response is never answered (dispatch); the caller still hears back.
+    if (msg.header.qr) return cb(new Error('the message is a response (QR set), not a query'));
+    var reply = function(responseBytes, res){
+      var ttl;
+      var secs = res ? [res.answers, res.authority] : [];
+      for (var s1 = 0; s1 < secs.length; s1++){
+        for (var r1 = 0; r1 < (secs[s1] ? secs[s1].length : 0); r1++){
+          var rr = secs[s1][r1];
+          if (rr && typeof rr.ttl === 'number' && (ttl === undefined || rr.ttl < ttl)) ttl = rr.ttl;
+        }
+      }
+      cb(null, responseBytes, { ttl: ttl });
+    };
+    dispatch(msg, peer.transport || 'https',
+      { address: peer.address || '', port: peer.port | 0 }, u8, { reply: reply, tls: peer.tls || null });
+  }
+
+  // The server: an EventEmitter ('accept'), with these methods.
+  return Object.assign(server, {
+    handleMessage: handleMessage,
     close: function(cb){
       var pending = 0; var done = function(){ if (--pending===0 && cb) cb(); };
       if (serverCtx.udp4){ pending++; serverCtx.udp4.close(done); }
@@ -990,7 +1508,7 @@ function createServer(options, handler){
       return 0;
     },
     context: serverCtx
-  };
+  });
 }
 
 
@@ -1096,6 +1614,9 @@ function buildDnssecMaterial(params){
   // --- output in simple format for use ---
   return {
     signersName: signer,
+    // The DS record for the parent zone, in presentation form — what a
+    // registrar's DNSSEC page asks for (key tag, algorithm, digest type, digest).
+    ds: signer + ' IN DS ' + kskTag + ' ' + algorithm + ' ' + digestType + ' ' + dsHex,
     ksk: {
       keyTag:     kskTag,
       privateKey: toB64(kskPrivRaw),
@@ -1226,7 +1747,14 @@ function answerFromZone(zone,qname,qtype,qclass){
       // no match at all for the original qname
       if (existsName(current)){
         var soaN = negativeSOA();
-        return { rcode:0, answers:[], authority: soaN?[soaN]:[], additionals:[], reason:'NODATA' };
+        // The types that do exist here — what the NSEC proving this NODATA
+        // lists (copy to res.types).
+        var present = [];
+        var atName = collectAllTypes(current);
+        for (var pt = 0; pt < atName.length; pt++){
+          if (present.indexOf(atName[pt].type) < 0) present.push(atName[pt].type);
+        }
+        return { rcode:0, answers:[], authority: soaN?[soaN]:[], additionals:[], types: present, reason:'NODATA' };
       }
       var soaX = negativeSOA();
       return { rcode:3, answers:[], authority: soaX?[soaX]:[], additionals:[], reason:'NXDOMAIN' };

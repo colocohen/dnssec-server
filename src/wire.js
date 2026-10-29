@@ -29,6 +29,7 @@ import {
   makeNameRdataEncoder,
   encodeTypeBitmaps,
   decodeTypeBitmaps,
+  svcKeyCode,
 } from './types.js';
 
 import { parseEDNSOptions, buildEDNSOptions } from './edns.js';
@@ -261,19 +262,35 @@ function decodeMessage(buf){
     questions.push(q.value);
   }
   var answers = [], authority=[], additionals=[], edns=null;
+  // What makes the message malformed though every byte decodes (RFC 6891
+  // §6.1.1): an OPT RR outside the additional section, a second one, or one
+  // not owned by the root. A server answers such a query FORMERR; the decoder
+  // says so (formatError) rather than throwing, so the question can still be
+  // echoed in that answer.
+  var formatError = null;
 
-  function readRRs(n, into){
+  function readRRs(n, into, section){
     for (var i=0;i<n;i++){
       var rr = decodeRR(buf, off); off = rr.off;
-      if (rr.value._edns){ edns = rr.value._edns; /* raw RR also available if needed */ }
+      if (rr.value._edns){
+        if (edns && !formatError) formatError = 'more than one OPT RR';
+        else if (section !== 'additional' && !formatError) formatError = 'OPT RR outside the additional section';
+        else if (rr.value.name !== '' && rr.value.name !== '.' && !formatError) formatError = 'OPT RR not owned by the root';
+        if (!edns) edns = rr.value._edns;
+      }
       into.push({ name: rr.value.name, type: rr.value.type, class: rr.value.class, ttl: rr.value.ttl, data: rr.value.data });
     }
   }
-  readRRs(h.ancount, answers);
-  readRRs(h.nscount, authority);
-  readRRs(h.arcount, additionals);
+  readRRs(h.ancount, answers, 'answer');
+  readRRs(h.nscount, authority, 'authority');
+  readRRs(h.arcount, additionals, 'additional');
 
-  return { header: h, questions, answers, authority, additionals, edns };
+  // The RCODE is 12 bits with EDNS (RFC 6891 §6.1.3): its upper 8 in the
+  // OPT RR, its lower 4 in the header. header.rcode is the whole of it —
+  // BADVERS reads 16, not 0; edns.extRcode keeps the OPT's raw octet.
+  if (edns) h.rcode = ((edns.extRcode & 0xFF) << 4) | (h.rcode & 0xF);
+
+  return { header: h, questions, answers, authority, additionals, edns, formatError };
 }
 
 // Shared encode buffer — reused across calls (safe: encodeMessage is synchronous)
@@ -294,6 +311,19 @@ function encodeMessage(msg){
   }, msg.header||{});
   h.qdcount = qd; h.ancount = an; h.nscount = ns; h.arcount = ar;
 
+  // header.rcode is the whole 12-bit RCODE (RFC 6891 §6.1.3): its lower 4
+  // bits go in the header, its upper 8 in the OPT RR's extended-RCODE octet.
+  // BADVERS (16) was written whole into that octet and read as 256. A code
+  // above 15 cannot be sent without an OPT RR.
+  var fullRcode = h.rcode | 0;
+  var upperRcode = fullRcode >> 4;
+  var edns = msg.edns;
+  if (upperRcode > 0 && !hasExplicitOPT){   // an OPT RR given in additionals carries its own octet
+    if (!edns) throw new Error('RCODE ' + fullRcode + ' needs an OPT RR (RFC 6891 §6.1.3): the message has none');
+    edns = Object.assign({}, edns, { extRcode: upperRcode & 0xFF });
+  }
+  h = Object.assign({}, h, { rcode: fullRcode & 0xF });
+
   var out = _encodeBuf, off = 0;
   out.set(encodeHeader(h), off); off += 12;
 
@@ -313,8 +343,8 @@ function encodeMessage(msg){
   writeRRArray(msg.authority||[]);
   // additionals + implicit EDNS
   var add = msg.additionals ? msg.additionals.slice() : [];
-  if (msg.edns && !hasExplicitOPT){
-    add.push({ name: '.', type:'OPT', edns: msg.edns });
+  if (edns && !hasExplicitOPT){
+    add.push({ name: '.', type:'OPT', edns: edns });
   }
   writeRRArray(add);
 
@@ -537,6 +567,9 @@ function parseZone(zoneText, opts){
     if (!origin) return name+'.';
     return name+'.'+ensureNoDot(origin)+'.';
   }
+  // A character-string's escapes (RFC 1035 §5.1): \X is X, \DDD the octet
+  // whose DECIMAL value is DDD. It was read as octal — \065 gave '5', not
+  // 'A'.
   function unescapeText(s){
     var out='';
     for (var i=0;i<s.length;i++){
@@ -544,8 +577,8 @@ function parseZone(zoneText, opts){
       if (c==='\\'){
         var j=i+1;
         if (j+2<s.length && isDigit(s[j])&&isDigit(s[j+1])&&isDigit(s[j+2])){
-          var oct=s.substr(j,3);
-          var code=parseInt(oct,8)&0xFF;
+          var code=parseInt(s.substr(j,3),10);
+          if (code>255) throw new Error('escape \\'+s.substr(j,3)+' is not an octet');
           out+=String.fromCharCode(code);i+=3;continue;
         }
         if (j<s.length){out+=s[j];i++;continue;}
@@ -557,9 +590,11 @@ function parseZone(zoneText, opts){
 
   function splitLogicalLines(txt){
     var lines=txt.split(/\r?\n/);
-    var out=[];var cur='';var depth=0;
+    // Each logical line with the number of the line it starts on, for errors.
+    var out=[];var cur='';var depth=0;var start=1;
     for (var li=0;li<lines.length;li++){
       var line=lines[li];
+      if (cur==='') start=li+1;
       var q=false;var esc=false;var cleaned='';
       for (var k=0;k<line.length;k++){
         var ch=line[k];
@@ -573,31 +608,102 @@ function parseZone(zoneText, opts){
       cur+=(cleaned+' ');
       if (depth===0){
         var trimmed=cur.replace(/\s+/g,' ').trim();
-        if (trimmed.length>0) out.push(trimmed);
+        if (trimmed.length>0) out.push({ text:trimmed, line:start });
         cur='';
       }
     }
-    if (cur.trim().length>0) out.push(cur.trim());
+    if (cur.trim().length>0) out.push({ text:cur.replace(/\s+/g,' ').trim(), line:start });
     return out;
   }
 
-  function tokenize(s){
-    var toks=[];var buf='';var q=false;var esc=false;
+  // Tokens of a logical line. A quoted string is one token, its quotes off
+  // and its escapes KEPT (\X, \DDD), as an unquoted one keeps them: each
+  // record type unescapes its character-strings itself (unescapeText). They
+  // were consumed here, inside quotes only — "a\065b" lost its escape and
+  // read "a065b", while a\065b unquoted kept it.
+  //
+  // svcb: SVCB/HTTPS presentation (RFC 9460 §2.1), where a parameter is
+  // key=value and the value may be quoted — alpn="h3,h2" is ONE token,
+  // `alpn=h3,h2`. Split at the quote, it was two: alpn= with nothing, and
+  // "h3,h2" as a key of its own; an ech="..." in quotes vanished, silently.
+  function tokenize(s, svcb){
+    var toks=[];var buf='';var q=false;var esc=false;var joined=false;
     for (var i=0;i<s.length;i++){
       var ch=s[i];
       if (q){
         if (esc){buf+=ch;esc=false;continue;}
-        if (ch==='\\'){esc=true;continue;}
-        if (ch==='"'){q=false;toks.push(buf);buf='';continue;}
+        if (ch==='\\'){buf+=ch;esc=true;continue;}
+        if (ch==='"'){q=false;if (!joined){toks.push(buf);buf='';}joined=false;continue;}
         buf+=ch;continue;
       } else {
-        if (ch==='"'){if (buf.length){toks.push(buf);buf='';}q=true;continue;}
+        if (ch==='"'){
+          if (svcb && buf.length && buf[buf.length-1]==='='){q=true;joined=true;continue;}
+          if (buf.length){toks.push(buf);buf='';}q=true;continue;
+        }
         if (/\s/.test(ch)){if (buf.length){toks.push(buf);buf='';}continue;}
         buf+=ch;
       }
     }
     if (buf.length) toks.push(buf);
     return toks;
+  }
+
+  // An SVCB value-list (RFC 9460 Appendix A.1): comma-separated, where \,
+  // is a comma inside an item and \\ a backslash.
+  function svcValueList(v){
+    var items=[], cur='';
+    for (var i=0;i<v.length;i++){
+      var ch=v[i];
+      if (ch==='\\' && i+1<v.length){
+        if (i+3<v.length && isDigit(v[i+1])&&isDigit(v[i+2])&&isDigit(v[i+3])){ cur+=String.fromCharCode(parseInt(v.substr(i+1,3),10)); i+=3; continue; }
+        cur+=v[i+1]; i++; continue;
+      }
+      if (ch===','){ items.push(cur); cur=''; continue; }
+      cur+=ch;
+    }
+    items.push(cur);
+    return items;
+  }
+
+  // SVCB / HTTPS RDATA in presentation form (RFC 9460 §2.1, Appendix A):
+  // SvcPriority TargetName key[=value]... with the registered names and
+  // keyNNNNN for any other. AliasMode (priority 0) carries no parameters
+  // (§2.4.2); a key twice is an error (§2.1).
+  function parseSvcbRdata(rdtoks){
+    var priority=toU32(rdtoks[0]); var target=absName(rdtoks[1], state.origin);
+    if (priority===null || !target) throw new Error('SVCB: SvcPriority and TargetName are required');
+    var ps={}, unknown=[], seenKeys={};
+    for (var pi=2;pi<rdtoks.length;pi++){
+      var tok=String(rdtoks[pi]); var eq=tok.indexOf('=');
+      var name=(eq>=0?tok.slice(0,eq):tok).toLowerCase(); var v=(eq>=0?tok.slice(eq+1):null);
+      var code=svcKeyCode(name);
+      if (seenKeys[code]) throw new Error('SVCB: key ' + name + ' twice');
+      seenKeys[code]=true;
+      switch(code){
+        case 0: if (v===null) throw new Error('SVCB: mandatory needs a value'); ps.mandatory=svcValueList(v); break;
+        case 1: if (v===null) throw new Error('SVCB: alpn needs a value'); ps.alpn=svcValueList(v); break;
+        case 2: if (v!==null) throw new Error('SVCB: no-default-alpn takes no value'); ps.noDefaultAlpn=true; break;
+        case 3: { var port=toU32(unescapeText(v||'')); if (port===null || port>65535) throw new Error('SVCB: port'); ps.port=port; break; }
+        case 4: if (v===null) throw new Error('SVCB: ipv4hint needs a value'); ps.ipv4hint=svcValueList(v); break;
+        case 5: if (v===null) throw new Error('SVCB: ech needs a value'); ps.ech=b64ToBytes(unescapeText(v)); break;
+        case 6: if (v===null) throw new Error('SVCB: ipv6hint needs a value'); ps.ipv6hint=svcValueList(v); break;
+        case 7: if (v===null) throw new Error('SVCB: dohpath needs a value'); ps.dohpath=unescapeText(v); break;
+        case 8: if (v!==null && v!=='') throw new Error('SVCB: ohttp takes no value'); ps.ohttp=true; break;
+        case 9: if (v===null) throw new Error('SVCB: tls-supported-groups needs a value'); ps.tlsSupportedGroups=svcValueList(v).map(function(x){ var n=toU32(x); if (n===null||n>65535) throw new Error('SVCB: tls-supported-groups'); return n; }); break;
+        default: {
+          // keyNNNNN: the value as octets (UTF-8 of the unescaped text).
+          unknown.push({ key: code, value: __te_zone.encode(v===null?'':unescapeText(v)) });
+        }
+      }
+    }
+    if (priority===0 && (pi=Object.keys(seenKeys).length)>0) throw new Error('SVCB: AliasMode (priority 0) carries no SvcParams');
+    if (unknown.length) ps.unknown=unknown;
+    var data = { priority:priority, targetName:target, paramsStructured:ps };
+    // What the encoder refuses — a mandatory key that is absent, an ech that
+    // is not an ECHConfigList — is refused here, at its line, not on the
+    // first query. One set of rules: the encoder's.
+    types.SVCB.encode(data);
+    return data;
   }
 
   function stableStringify(obj){
@@ -611,7 +717,9 @@ function parseZone(zoneText, opts){
     return rr.name+'|'+rr.type+'|'+rr.class+'|'+(rr.ttl>>>0)+'|'+stableStringify(rr.data);
   }
 
-  function parseRR(tokens, state){
+  var __te_zone = new TextEncoder();
+
+  function parseRR(tokens, state, line){
     var idx=0;var owner=null,ttl=null,rrclass='IN',type=null;
     if (tokens[0]&&tokens[0][0]==='$'){
       var d=tokens[0].toUpperCase();
@@ -637,8 +745,24 @@ function parseZone(zoneText, opts){
     var fqdn=absName(owner,state.origin);
     if (ttl===null) ttl=state.default_ttl!=null?state.default_ttl:3600;
     var rdtoks=tokens.slice(idx);
+    // SVCB/HTTPS: again, the way their parameters are written (tokenize).
+    if ((type==='SVCB' || type==='HTTPS') && line!=null) rdtoks=tokenize(line, true).slice(idx);
 
     var rr={ name:fqdn, type:type, class:rrclass, ttl:ttl>>>0, data:null };
+
+    // RFC 3597 §5: any type's RDATA as "\# <length> <hex>" — read as the
+    // type's own wire form where there is a decoder, raw where not. Without
+    // it, the hex was taken as base64 or as the type's fields.
+    if (rdtoks[0]==='\\#'){
+      var glen=toU32(rdtoks[1]); var gbytes=hexToBytes(rdtoks.slice(2).join(''));
+      if (glen===null || gbytes.length!==glen) throw new Error(type + ': \\# length ' + rdtoks[1] + ' does not match its ' + gbytes.length + ' bytes');
+      var tdef=types[type];
+      if (tdef && tdef.decode && glen>0){ rr.data=tdef.decode(gbytes, 0, glen).value; }
+      else rr.data={ raw: gbytes };
+      state.last_owner = owner || state.last_owner;
+      return rr;
+    }
+
 
     function nameArg(i){ return absName(rdtoks[i], state.origin); }
     function intArg(i){ return toU32(rdtoks[i]); }
@@ -657,21 +781,31 @@ function parseZone(zoneText, opts){
       case 'DNAME': rr.data={ name: nameArg(0) }; break;
       case 'MX': rr.data={ preference:intArg(0), exchange:nameArg(1) }; break;
       case 'TXT': rr.data={ texts: rdtoks.map(unescapeText) }; break;
-      case 'HINFO': rr.data={ cpu: rdtoks[0], os: rdtoks[1] }; break;
+      case 'HINFO': rr.data={ cpu: unescapeText(rdtoks[0]||''), os: unescapeText(rdtoks[1]||'') }; break;
       case 'MINFO': rr.data={ rmailbx: nameArg(0), emailbx: nameArg(1) }; break;
       case 'RP': rr.data={ mbox: nameArg(0), txt: nameArg(1) }; break;
       case 'AFSDB': rr.data={ subtype: intArg(0), hostname: nameArg(1) }; break;
-      case 'X25': rr.data={ address: rdtoks[0] }; break;
-      case 'ISDN': rr.data={ address: rdtoks[0], sa: rdtoks[1]||undefined }; break;
+      case 'X25': rr.data={ address: unescapeText(rdtoks[0]||'') }; break;
+      case 'ISDN': rr.data={ address: unescapeText(rdtoks[0]||''), sa: rdtoks[1]!=null ? unescapeText(rdtoks[1]) : undefined }; break;
       case 'RT': rr.data={ preference: intArg(0), host: nameArg(1) }; break;
       case 'NSAP': rr.data={ address: hexToBytes(rdtoks[0]) }; break;
       case 'PX': rr.data={ preference: intArg(0), MAP822: nameArg(1), MAPX400: nameArg(2) }; break;
-      case 'GPOS': rr.data={ latitude: rdtoks[0], longitude: rdtoks[1], altitude: rdtoks[2] }; break;
+      case 'GPOS': rr.data={ latitude: unescapeText(rdtoks[0]||''), longitude: unescapeText(rdtoks[1]||''), altitude: unescapeText(rdtoks[2]||'') }; break;
       case 'WKS': rr.data={ address: rdtoks[0], protocol: intArg(1), bitmap: textTokensToBytes(rdtoks.slice(2)) }; break;
       case 'NULL': rr.data={ raw: textTokensToBytes(rdtoks) }; break;
 
       case 'SRV': rr.data={ priority:intArg(0), weight:intArg(1), port:intArg(2), target:nameArg(3) }; break;
-      case 'NAPTR': rr.data={ order:intArg(0), preference:intArg(1), flags:rdtoks[2], services:rdtoks[3], regexp:rdtoks[4], replacement:nameArg(5) }; break;
+      case 'NAPTR': rr.data={ order:intArg(0), preference:intArg(1), flags:unescapeText(rdtoks[2]||''), services:unescapeText(rdtoks[3]||''), regexp:unescapeText(rdtoks[4]||''), replacement:nameArg(5) }; break;
+      // CAA (RFC 8659 §4.1.1): flags, tag, value — the value a
+      // character-string. There was no case: a zone file's CAA went to the
+      // default, its text decoded as base64, and the record served was
+      // garbage — one that can stop a CA from issuing for the domain.
+      case 'CAA': {
+        var caaFlags=intArg(0), caaTag=String(rdtoks[1]||'');
+        if (caaFlags===null || caaFlags>255 || !/^[A-Za-z0-9]+$/.test(caaTag)) throw new Error('CAA: flags 0-255 and an alphanumeric tag are required');
+        rr.data={ flags:caaFlags, tag:caaTag.toLowerCase(), value: unescapeText(rdtoks.slice(2).join(' ')) };
+        break;
+      }
       case 'URI': rr.data={ priority: intArg(0), weight: intArg(1), target: unescapeText(rdtoks.slice(2).join(' ')) }; break;
 
       case 'DNSKEY':
@@ -718,25 +852,7 @@ function parseZone(zoneText, opts){
       }
 
       case 'SVCB':
-      case 'HTTPS':{
-        var priority=intArg(0);var target=nameArg(1);
-        var paramsStructured={};
-        for (var pi=2;pi<rdtoks.length;pi++){
-          var p=String(rdtoks[pi]);var eq=p.indexOf('=');var k=(eq>=0?p.slice(0,eq):p).toLowerCase();var v=(eq>=0?p.slice(eq+1):null);
-          if (v&&v[0]==='"'&&v[v.length-1]==='"') v=v.slice(1,-1);
-          if (v==null){ if (k==='no-default-alpn') paramsStructured.noDefaultAlpn = true; else paramsStructured[k]=true; continue; }
-          if (k==='alpn') paramsStructured.alpn=v.split(',');
-          else if (k==='port') paramsStructured.port=parseInt(v,10)>>>0;
-          else if (k==='ipv4hint') paramsStructured.ipv4hint=v.split(',');
-          else if (k==='ipv6hint') paramsStructured.ipv6hint=v.split(',');
-          else if (k==='ech') paramsStructured.ech = b64ToBytes(v);
-          else if (k==='dohpath') paramsStructured.dohpath = v;
-          else if (k==='tls-supported-groups') paramsStructured.tlsSupportedGroups = v.split(',').map(function(x){return parseInt(x,10)>>>0;});
-          else paramsStructured[k]=v;
-        }
-        rr.data={ priority:priority, targetName:target, paramsStructured:paramsStructured };
-        break;
-      }
+      case 'HTTPS': rr.data=parseSvcbRdata(rdtoks); break;
 
       case 'HIP': rr.data={ algorithm:intArg(0), hit: b64ToBytes(rdtoks[1]), publicKey: b64ToBytes(rdtoks[2]), servers: rdtoks.slice(3).map(function(x){return absName(x, state.origin);}) }; break;
       case 'NID': rr.data={ preference:intArg(0), nodeIdHigh: toU32(rdtoks[1]), nodeIdLow: toU32(rdtoks[2]) }; break;
@@ -778,7 +894,9 @@ function parseZone(zoneText, opts){
   var seen = Object.create(null); // key→true for dedup
 
   for (var i=0;i<logical.length;i++){
-    var rr=parseRR(tokenize(logical[i]),state);
+    var rr;
+    try { rr=parseRR(tokenize(logical[i].text),state,logical[i].text); }
+    catch (e) { e.message='zone line '+logical[i].line+': '+e.message; e.line=logical[i].line; throw e; }
     if (!rr) continue;
     var key = rrKey(rr); if (seen[key]) continue; seen[key] = true; // de-dup
     zone.records.push(rr);

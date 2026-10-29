@@ -427,10 +427,14 @@ function decode_ipv6hint(u8){
   return out;
 }
 function encode_ipv6hint(items){
+  // Each a 16-byte address, or its text form ("2001:db8::1") — as ipv4hint
+  // takes "192.0.2.1". Only bytes were taken, and a zone file's ipv6hint=
+  // (parseZone gives text) threw on every record that had one.
   const out = new Uint8Array(items.length * 16); let o=0;
   for (const it of items){
-    if (!(it instanceof Uint8Array) || it.length!==16) throw new Error('ipv6hint item must be 16 bytes');
-    out.set(it, o); o+=16;
+    const b = (typeof it === 'string') ? ipv6ToBytes(it) : it;
+    if (!(b instanceof Uint8Array) || b.length!==16) throw new Error('ipv6hint item must be 16 bytes or an IPv6 address');
+    out.set(b, o); o+=16;
   }
   return out;
 }
@@ -467,9 +471,30 @@ function encode_tls_supported_groups(ids){
   return out;
 }
 
-// ech: opaque bytes (per IANA registry). leave as-is
+// ech: an ECHConfigList (draft-ietf-tls-esni §4; RFC 9460 §9) — opaque to
+// DNS, but checked for its framing before it goes out: a two-byte length
+// that covers the rest, then ECHConfigs of version (2) + length (2) +
+// contents each. A list cut short, or bytes that are not one (a base64
+// typo, a file read wrong), would reach every client as the server's key,
+// and ECH would fail for all of them with nothing said here.
+function checkEchConfigList(u8){
+  if (u8.length < 2) throw new Error('ech: ECHConfigList too short');
+  const total = (u8[0] << 8) | u8[1];
+  if (total !== u8.length - 2 || total === 0) throw new Error('ech: ECHConfigList length ' + total + ' does not match its ' + (u8.length - 2) + ' bytes');
+  let off = 2;
+  while (off < u8.length){
+    if (off + 4 > u8.length) throw new Error('ech: truncated ECHConfig');
+    const len = (u8[off + 2] << 8) | u8[off + 3];
+    off += 4 + len;
+    if (off > u8.length) throw new Error('ech: ECHConfig longer than the list');
+  }
+}
 function decode_ech(u8){ return u8.slice(0); }
-function encode_ech(u8){ return (u8 instanceof Uint8Array) ? u8.slice(0) : new Uint8Array(0); }
+function encode_ech(u8){
+  if (!(u8 instanceof Uint8Array)) throw new Error('ech: an ECHConfigList (Uint8Array) is required');
+  checkEchConfigList(u8);
+  return u8.slice(0);
+}
 
 // ---- master parse/build of SvcParams ----
 function parseSvcParams(rawList){
@@ -484,7 +509,7 @@ function parseSvcParams(rawList){
     ech: undefined,               // Uint8Array
     ipv6hint: undefined,          // Uint8Array[] (16b each)
     dohpath: undefined,           // string
-    ohttp: undefined,             // reserved/use per RFC 9540 §4 (string URL or bytes)
+    ohttp: undefined,             // true when present (RFC 9540 §4: no value)
     tlsSupportedGroups: undefined,// number[]
     // passthrough for unknown keys
     unknown: []                   // array of { key, value(Uint8Array) }
@@ -505,8 +530,9 @@ function parseSvcParams(rawList){
       case SvcParamKeys.dohpath: out.dohpath = decode_dohpath(v); break;
       case SvcParamKeys.tlsSupportedGroups: out.tlsSupportedGroups = decode_tls_supported_groups(v); break;
       case SvcParamKeys.ohttp:
-        // RFC 9540 defines ohttp param: content is an absolute/relative URI (UTF‑8). Many impls use text.
-        out.ohttp = __td.decode(v); break;
+        // RFC 9540 §4: a flag — present or not; its value MUST be empty.
+        if (v.length !== 0) throw new Error('ohttp must be empty');
+        out.ohttp = true; break;
       default:
         out.unknown.push({ key:k, value:v.slice(0) });
     }
@@ -514,10 +540,26 @@ function parseSvcParams(rawList){
   return out;
 }
 
+// SvcParamKey names as RFC 9460 §14.3.2 registers them, and keyNNNNN.
+const SVC_KEY_NAMES = { 'mandatory': 0, 'alpn': 1, 'no-default-alpn': 2, 'port': 3, 'ipv4hint': 4, 'ech': 5,
+                        'ipv6hint': 6, 'dohpath': 7, 'ohttp': 8, 'tls-supported-groups': 9 };
+function svcKeyCode(k){
+  if (typeof k === 'number') return k >>> 0;
+  const s = String(k).toLowerCase();
+  if (s in SVC_KEY_NAMES) return SVC_KEY_NAMES[s];
+  const camel = SvcParamKeys[k];
+  if (camel !== undefined) return camel;
+  const m = /^key(\d{1,5})$/.exec(s);
+  if (m && +m[1] <= 65535) return +m[1];
+  throw new Error('unknown SvcParamKey "' + k + '"');
+}
+
 function buildSvcParams(obj){
   // obj: may contain known fields above + unknown[]
   const res = [];
-  if (obj.mandatory && obj.mandatory.length) res.push({ key: SvcParamKeys.mandatory, value: encode_mandatory(obj.mandatory) });
+  // mandatory: by code or by name ('alpn', 'key65000') — sorted, as the
+  // keys on the wire must be (RFC 9460 §8).
+  if (obj.mandatory && obj.mandatory.length) res.push({ key: SvcParamKeys.mandatory, value: encode_mandatory(obj.mandatory.map(svcKeyCode).sort(function (a, b) { return a - b; })) });
   if (obj.alpn && obj.alpn.length)           res.push({ key: SvcParamKeys.alpn,      value: encode_alpn(obj.alpn) });
   if (obj.noDefaultAlpn)                     res.push({ key: SvcParamKeys.noDefaultAlpn, value: new Uint8Array(0) });
   if (obj.port != null)                      res.push({ key: SvcParamKeys.port,      value: encode_port(obj.port) });
@@ -527,7 +569,9 @@ function buildSvcParams(obj){
   if (obj.dohpath != null)                   res.push({ key: SvcParamKeys.dohpath,   value: encode_dohpath(obj.dohpath) });
   if (obj.tlsSupportedGroups && obj.tlsSupportedGroups.length)
                                               res.push({ key: SvcParamKeys.tlsSupportedGroups, value: encode_tls_supported_groups(obj.tlsSupportedGroups) });
-  if (obj.ohttp != null)                     res.push({ key: SvcParamKeys.ohttp,     value: __te.encode(String(obj.ohttp)) });
+  // ohttp is a flag (RFC 9540 §4): present, with no value. It was the text
+  // of whatever was given — "true" from a zone file.
+  if (obj.ohttp)                             res.push({ key: SvcParamKeys.ohttp,     value: new Uint8Array(0) });
   if (obj.unknown && obj.unknown.length){
     for (const u of obj.unknown){
       res.push({ key: u.key>>>0, value: (u.value instanceof Uint8Array)? u.value.slice(0) : new Uint8Array(0) });
@@ -536,6 +580,24 @@ function buildSvcParams(obj){
   // IMPORTANT: SvcParam list MUST be sorted by key code on the wire (RFC 9460 §2.1)
   res.sort((a,b)=> (a.key|0) - (b.key|0));
   return res;
+}
+
+// RFC 9460 §2.2, §8: keys strictly increasing — no key twice — and every key
+// "mandatory" lists present, mandatory itself not among them, none twice.
+// Throws on a record that breaks them: what a client must treat as malformed
+// is not something to publish.
+function checkSvcParams(list){
+  for (let i = 1; i < list.length; i++){
+    if (list[i].key <= list[i - 1].key) throw new Error('SvcParamKey ' + list[i].key + ' repeated or out of order');
+  }
+  const m = list.find(function (p) { return p.key === SvcParamKeys.mandatory; });
+  if (!m) return;
+  const keys = decode_mandatory(m.value);
+  for (let j = 0; j < keys.length; j++){
+    if (keys[j] === SvcParamKeys.mandatory) throw new Error('mandatory lists itself');
+    if (j > 0 && keys[j] <= keys[j - 1]) throw new Error('mandatory keys repeated or out of order');
+    if (!list.some(function (p) { return p.key === keys[j]; })) throw new Error('mandatory key ' + keys[j] + ' is not in the record');
+  }
 }
 
 // ---- Replaced SVCB/HTTPS encode/decode with structured params ----
@@ -552,6 +614,9 @@ function decode_SVCB_HTTPS(buf, off, rdlen){
     const vlen = dv.getUint16(off, false); off += 2;
     if (off + vlen > end) throw new Error('SVCB param overflow');
     const val = buf.slice(off, off+vlen); off += vlen;
+    // §2.2: "SvcParamKeys SHALL appear in increasing numeric order";
+    // otherwise the RR is malformed.
+    if (params.length && key <= params[params.length - 1].key) throw new Error('SVCB keys not in increasing order');
     params.push({ key, value: val });
   }
   if (off !== end) throw new Error('SVCB trailing bytes');
@@ -580,6 +645,7 @@ function encode_SVCB_HTTPS(v){
   for (const p of structured){ byKey.set(p.key, p); }
 
   const merged = Array.from(byKey.values()).sort((a,b)=> (a.key|0)-(b.key|0));
+  checkSvcParams(merged);
 
   // head (priority) + TargetName + params
   const head = new Uint8Array(2); new DataView(head.buffer).setUint16(0, (v.priority|0)>>>0, false);
@@ -895,4 +961,5 @@ export {
   makeNameRdataEncoder,
   encodeTypeBitmaps,
   decodeTypeBitmaps,
+  svcKeyCode,
 };
