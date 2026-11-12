@@ -27,6 +27,7 @@ import * as wire from './wire.js';
 import { buildEDNSOptions } from './edns.js';
 import { createCookieJar } from './cookies.js';
 import { fqdn, ensureDot } from './utils.js';
+import * as keys from './keys.js';
 // NOTE: the encrypted transports — DoT and DoQ — both run on quico and
 // lemon-tls, so one SNICallback and one kind of certificate context serve
 // them both.
@@ -404,7 +405,10 @@ function finalizeWire(serverCtx, req, res){
   return toU8(wire2);
 }
 
-function signRRset(signer_name,rrset_bytes,algorithm,key_tag,sig_expiration,sig_inception,private_key,labels,rr_type,ttl){
+// The bytes an RRSIG signs (RFC 4034 §3.1.8.1): the RRSIG RDATA without its
+// signature, then the RRset in canonical form. Which algorithm signs them is
+// the key's business (keys.js).
+function rrsigPayload(signer_name,rrset_bytes,algorithm,key_tag,sig_expiration,sig_inception,labels,rr_type,ttl){
 
   var tmp = new Uint8Array(256);
   var off = 0;
@@ -437,24 +441,13 @@ function signRRset(signer_name,rrset_bytes,algorithm,key_tag,sig_expiration,sig_
   header_bytes[16] = (key_tag >> 8) & 0xff;
   header_bytes[17] = key_tag & 0xff;
 
-  var hash_payload = new Uint8Array(
+  var payload = new Uint8Array(
     header_bytes.length + signer_name_bytes.length + rrset_bytes.length
   );
-  hash_payload.set(header_bytes, 0);
-  hash_payload.set(signer_name_bytes, header_bytes.length);
-  hash_payload.set(rrset_bytes, header_bytes.length + signer_name_bytes.length);
-
-  if(algorithm === 13) {
-    // ECDSAP256SHA256: sign with node:crypto (SHA-256 + P-256)
-    var keyObj = createP256SigningKey(toU8(private_key));
-    // ieee-p1363 = compact r||s (64 bytes), which is what DNSSEC expects
-    var sig_data = new Uint8Array(crypto.sign('sha256', Buffer.from(hash_payload), { key: keyObj, dsaEncoding: 'ieee-p1363' }));
-
-    return sig_data;
-  }
-  
-  return null;
-  
+  payload.set(header_bytes, 0);
+  payload.set(signer_name_bytes, header_bytes.length);
+  payload.set(rrset_bytes, header_bytes.length + signer_name_bytes.length);
+  return payload;
 }
 
 // RFC 4034 §3.1.3: the Labels field is the number of labels in the owner name,
@@ -498,7 +491,9 @@ function eachSeries(items, iter, done){
   })();
 }
 
-// Sign one RRset (with cache) and invoke cb(err, rrsigRecord|null).
+// Sign one RRset (with cache) and invoke cb(err, rrsigRecord|null, unsigned).
+// unsigned: why there is no signature when the material has no key for it -
+// the caller reports it (onError), and the answer goes out unsigned.
 function signRRsetWithCache(ctx, material, rrset, cb){
   var first = rrset[0];
   var typeUpper = String(first.type).toUpperCase();
@@ -512,7 +507,10 @@ function signRRsetWithCache(ctx, material, rrset, cb){
   // points at); everything else with the ZSK.
   var keySet = (typeUpper === 'DNSKEY' || typeUpper === 'CDS' || typeUpper === 'CDNSKEY');
   var key = keySet ? material.ksk : material.zsk;
-  if (!key || !key.privateKey) return cb(null, null);
+  if (!key || (!key.privateKey && !key.signer)){
+    return cb(null, null, (keySet ? 'ksk' : 'zsk') + (key ? ' has neither privateKey nor signer' : ' is missing'));
+  }
+  var algorithm = Number(key.algorithm) || 13;
 
   var now = Math.floor(Date.now() / 1000);
   // Validity window: taken from the key material if provided, otherwise the
@@ -535,34 +533,52 @@ function signRRsetWithCache(ctx, material, rrset, cb){
     type: typeUpper,
     class: first.class || 'IN',
     keyTag: Number(key.keyTag),
+    algorithm: algorithm,
     hash: toHex(sha256(rrset_bytes))
   };
 
-  function doSign(){
-    var labels = rrsigLabelCount(first.name);
-    var sig_data = signRRset(material.signersName, rrset_bytes, 13, key.keyTag,
-                             expiration, inception, key.privateKey, labels, typeUpper, first.ttl);
-    var rrsig_record = {
-      name: first.name,
-      type: 'RRSIG',
-      class: first.class || 'IN',
-      ttl: first.ttl,
-      data: {
-        typeCovered: wire.type_to_code[typeUpper] || 0,
-        algorithm: 13,
-        labels: labels,
-        originalTTL: first.ttl,
-        expiration: expiration,
-        inception: inception,
-        keyTag: Number(key.keyTag),
-        signersName: material.signersName,
-        signature: sig_data,
-      }
-    };
-    if (ctx._dnssecCache){
-      try { ctx._dnssecCache.set(cacheParams, { rrsig: rrsig_record, expiration: expiration, inception: inception }, function(){}); } catch(e){}
+  // One signature in flight per RRset and key: with a remote signer, a burst
+  // of queries for the same name asks it once
+  var flightKey = cacheParams.hash + '|' + cacheParams.keyTag + '|' + algorithm;
+  var inflight = ctx._dnssecInflight || (ctx._dnssecInflight = new Map());
+
+  function doSign(done){
+    var waiting = inflight.get(flightKey);
+    if (waiting) return waiting.push(done);
+    inflight.set(flightKey, [done]);
+    function finish(err, rrsig){
+      var w = inflight.get(flightKey) || [];
+      inflight.delete(flightKey);
+      w.forEach(function(f){ f(err, rrsig); });
     }
-    return rrsig_record;
+
+    var labels = rrsigLabelCount(first.name);
+    var payload = rrsigPayload(material.signersName, rrset_bytes, algorithm, Number(key.keyTag),
+                               expiration, inception, labels, typeUpper, first.ttl);
+    keys.signPayload(key, payload, { signTimeout: dnssecOpt.signTimeout, signRetries: dnssecOpt.signRetries }, function(err, sig_data){
+      if (err) return finish(err);
+      var rrsig_record = {
+        name: first.name,
+        type: 'RRSIG',
+        class: first.class || 'IN',
+        ttl: first.ttl,
+        data: {
+          typeCovered: wire.type_to_code[typeUpper] || 0,
+          algorithm: algorithm,
+          labels: labels,
+          originalTTL: first.ttl,
+          expiration: expiration,
+          inception: inception,
+          keyTag: Number(key.keyTag),
+          signersName: material.signersName,
+          signature: sig_data,
+        }
+      };
+      if (ctx._dnssecCache){
+        try { ctx._dnssecCache.set(cacheParams, { rrsig: rrsig_record, expiration: expiration, inception: inception }, function(){}); } catch(e){}
+      }
+      finish(null, rrsig_record);
+    });
   }
 
   if (ctx._dnssecCache){
@@ -575,12 +591,26 @@ function signRRsetWithCache(ctx, material, rrset, cb){
       if (!err && fresh){
         cb(null, cached.rrsig);
       } else {
-        try { cb(null, doSign()); } catch(e){ cb(e); }
+        doSign(cb);
       }
     });
   } else {
-    try { cb(null, doSign()); } catch(e){ cb(e); }
+    doSign(cb);
   }
+}
+
+// An answer that goes out unsigned because the material has no key for it:
+// reported through onError - once a minute per zone and key, not per query
+var unsignedReported = new Map();
+function reportUnsigned(onError, material, why, transport){
+  var id = String(material && material.signersName) + '|' + why;
+  var now = Date.now();
+  if (unsignedReported.get(id) > now - 60000) return;
+  if (unsignedReported.size > 10000) unsignedReported.clear();
+  unsignedReported.set(id, now);
+  var e = new Error('DNSSEC: answers for ' + (material && material.signersName) + ' go out unsigned - ' + why);
+  e.code = 'DNSSEC_UNSIGNED';
+  onError(e, transport);
 }
 
 // ---------------------------------------------------------------
@@ -831,9 +861,10 @@ function sendResponse(ctx, req, res){
     groupRRsets(res.authority).forEach(function(g){ work.push({ section: res.authority, rrset: g }); });
 
     eachSeries(work, function(item, next){
-      signRRsetWithCache(ctx, material, item.rrset, function(err, rrsig){
+      signRRsetWithCache(ctx, material, item.rrset, function(err, rrsig, unsigned){
         if (err) return next(err);
         if (rrsig) item.section.push(rrsig);
+        else if (unsigned) reportUnsigned(onError, material, unsigned, req.transport);
         next();
       });
     }, function(err){
@@ -886,12 +917,12 @@ function autoAnswerIfApplicable(req, res, ctx, callback){
 
       if (t === 'DNSKEY'){
         if (result.ksk) res.answers.push({ name: owner, type: 'DNSKEY', class: 'IN', ttl: ttl,
-          data: { flags: 257, algorithm: 13, key: toU8(result.ksk.publicKey) } });
+          data: { flags: 257, algorithm: Number(result.ksk.algorithm) || 13, key: toU8(result.ksk.publicKey) } });
         if (result.zsk) res.answers.push({ name: owner, type: 'DNSKEY', class: 'IN', ttl: ttl,
-          data: { flags: 256, algorithm: 13, key: toU8(result.zsk.publicKey) } });
+          data: { flags: 256, algorithm: Number(result.zsk.algorithm) || 13, key: toU8(result.zsk.publicKey) } });
       } else if (t === 'CDNSKEY'){
         if (result.ksk) res.answers.push({ name: owner, type: 'CDNSKEY', class: 'IN', ttl: ttl,
-          data: { flags: 257, algorithm: 13, key: toU8(result.ksk.publicKey) } });
+          data: { flags: 257, algorithm: Number(result.ksk.algorithm) || 13, key: toU8(result.ksk.publicKey) } });
       } else if (t === 'CDS'){
         if (result.ksk && result.ksk.digest) res.answers.push({ name: owner, type: 'CDS', class: 'IN', ttl: ttl,
           data: { keyTag: result.ksk.keyTag, algorithm: result.ksk.algorithm || 13,
@@ -1138,13 +1169,13 @@ function createServer(options, handler){
       var _mapMax = (options.dnssec.cacheMax|0) || 10000;
       dnssecCache = {
         get: function(params, cb){
-          var k = params.hash + '|' + params.keyTag;
+          var k = params.hash + '|' + params.keyTag + '|' + (params.algorithm || 13);
           var v = _map.get(k);
           if (v !== undefined){ _map.delete(k); _map.set(k, v); } // refresh recency
           cb(null, v || null);
         },
         set: function(params, value, cb){
-          var k = params.hash + '|' + params.keyTag;
+          var k = params.hash + '|' + params.keyTag + '|' + (params.algorithm || 13);
           if (_map.has(k)) _map.delete(k);
           else if (_map.size >= _mapMax) _map.delete(_map.keys().next().value); // evict LRU
           _map.set(k, value);
@@ -1512,40 +1543,13 @@ function createServer(options, handler){
 }
 
 
-function deriveP256PublicXY(priv){
-  var ecdh = crypto.createECDH('prime256v1');
-  ecdh.setPrivateKey(Buffer.from(priv));
-  var full = ecdh.getPublicKey(); // 65 bytes: 0x04 || X || Y
-  var pub = new Uint8Array(full.buffer, full.byteOffset + 1, 64);
-  return pub;
-}
 
-function generateP256PrivateKey(){
-  var ecdh = crypto.createECDH('prime256v1');
-  ecdh.generateKeys();
-  return new Uint8Array(ecdh.getPrivateKey());
-}
 
 function sha256(data){
   return new Uint8Array(crypto.createHash('sha256').update(Buffer.from(data)).digest());
 }
 
-function sha384(data){
-  return new Uint8Array(crypto.createHash('sha384').update(Buffer.from(data)).digest());
-}
 
-function createP256SigningKey(privBytes){
-  var ecdh = crypto.createECDH('prime256v1');
-  ecdh.setPrivateKey(Buffer.from(privBytes));
-  var pub = ecdh.getPublicKey().slice(1); // 64 bytes X||Y
-  var jwk = {
-    kty: 'EC', crv: 'P-256',
-    d: Buffer.from(privBytes).toString('base64url'),
-    x: Buffer.from(pub.slice(0, 32)).toString('base64url'),
-    y: Buffer.from(pub.slice(32, 64)).toString('base64url')
-  };
-  return crypto.createPrivateKey({ key: jwk, format: 'jwk' });
-}
 
 function buildDnskeyRdata(flags, protocol, algorithm, publicKeyXY){
   var rdata = new Uint8Array(4 + publicKeyXY.length);
@@ -1568,11 +1572,22 @@ function computeDnskeyKeyTag(rdata){
 }
 
 
+// The keys of a zone, in the form keyCallback returns them.
+//
+//   buildDnssecMaterial({
+//     signersName: 'example.com.',
+//     algorithm: 13,                  // for generated keys and raw ones: 13 (P-256, default) or 15 (Ed25519)
+//     ksk: { privateKey },            // raw 32 bytes / base64 (as before), PEM, or a KeyObject
+//     zsk: { publicKey, sign },       // or an external signer: sign(bytes, cb(err, signature))
+//   })
+//
+// A key that is not given is generated. The KSK and the ZSK must use the
+// same algorithm: a zone whose DNSKEY set holds two algorithms must sign
+// every RRset with both (RFC 4035 §2.2, RFC 6840 §5.11), and this server
+// signs each with one key.
 function buildDnssecMaterial(params){
   if (!params || !params.signersName) throw new Error('signersName is required');
 
-  // constants per RFC
-  var algorithm  = 13;            // ECDSAP256SHA256
   var digestType = 2;             // SHA-256
   var protocol   = 3;             // always 3
   var KSK_FLAGS  = 257;           // SEP
@@ -1580,10 +1595,18 @@ function buildDnssecMaterial(params){
 
   var signer = fqdn(params.signersName);
 
+  var ksk = keys.readKey(params.ksk, params.algorithm, 'ksk');
+  var zsk = keys.readKey(params.zsk, params.algorithm || ksk.algorithm, 'zsk');
+  if (ksk.algorithm !== zsk.algorithm){
+    var e = new Error('the KSK is algorithm ' + ksk.algorithm + ' and the ZSK ' + zsk.algorithm +
+      ' - a zone signs with one algorithm here (RFC 4035 §2.2: every RRset needs a signature from each algorithm in the DNSKEY set)');
+    e.code = 'KEY_INVALID';
+    throw e;
+  }
+  var algorithm = ksk.algorithm;
+
   // --- KSK ---
-  var kskPrivRaw = (params.ksk && params.ksk.privateKey) ? toU8(params.ksk.privateKey) : generateP256PrivateKey();
-  var kskPubRaw  = deriveP256PublicXY(kskPrivRaw);
-  var kskRdata   = buildDnskeyRdata(KSK_FLAGS, protocol, algorithm, kskPubRaw);
+  var kskRdata   = buildDnskeyRdata(KSK_FLAGS, protocol, algorithm, ksk.publicKey);
   var kskTag     = computeDnskeyKeyTag(kskRdata);
 
   // compute DS (owner_wire + DNSKEY_RDATA of the KSK)
@@ -1594,43 +1617,38 @@ function buildDnssecMaterial(params){
   var toDigest   = new Uint8Array(ownerWire.length + kskRdata.length);
   toDigest.set(ownerWire, 0);
   toDigest.set(kskRdata, ownerWire.length);
-
-  var dsBytes;
-  if (digestType === 2) {
-    dsBytes = sha256(toDigest);
-  } else if (digestType === 4) {
-    dsBytes = sha384(toDigest);
-  } else {
-    throw new Error('Unsupported digestType (use 2 for SHA-256 or 4 for SHA-384)');
-  }
-  var dsHex = toHex(dsBytes);
+  var dsHex = toHex(sha256(toDigest));
 
   // --- ZSK ---
-  var zskPrivRaw = (params.zsk && params.zsk.privateKey) ? toU8(params.zsk.privateKey) : generateP256PrivateKey();
-  var zskPubRaw  = deriveP256PublicXY(zskPrivRaw);
-  var zskRdata   = buildDnskeyRdata(ZSK_FLAGS, protocol, algorithm, zskPubRaw);
+  var zskRdata   = buildDnskeyRdata(ZSK_FLAGS, protocol, algorithm, zsk.publicKey);
   var zskTag     = computeDnskeyKeyTag(zskRdata);
 
   // --- output in simple format for use ---
+  // A local key carries privateKey (base64, raw 32 bytes); a signer carries
+  // signer - the object given, kept as is (so this material is not JSON
+  // then: keep it in memory, or rebuild it from the signer).
+  var kskOut = {
+    keyTag:     kskTag,
+    publicKey:  toB64(ksk.publicKey),
+    algorithm:  algorithm,
+    digestType: digestType,
+    digest:     dsHex
+  };
+  if (ksk.signer) kskOut.signer = ksk.signer; else kskOut.privateKey = toB64(ksk.privateRaw);
+  var zskOut = {
+    keyTag:     zskTag,
+    publicKey:  toB64(zsk.publicKey),
+    algorithm:  algorithm,
+  };
+  if (zsk.signer) zskOut.signer = zsk.signer; else zskOut.privateKey = toB64(zsk.privateRaw);
+
   return {
     signersName: signer,
     // The DS record for the parent zone, in presentation form — what a
     // registrar's DNSSEC page asks for (key tag, algorithm, digest type, digest).
     ds: signer + ' IN DS ' + kskTag + ' ' + algorithm + ' ' + digestType + ' ' + dsHex,
-    ksk: {
-      keyTag:     kskTag,
-      privateKey: toB64(kskPrivRaw),
-      publicKey:  toB64(kskPubRaw),
-      algorithm:  algorithm,
-      digestType: digestType,
-      digest:     dsHex
-    },
-    zsk: {
-      keyTag:     zskTag,
-      privateKey: toB64(zskPrivRaw),
-      publicKey:  toB64(zskPubRaw),
-      algorithm:  algorithm,
-    }
+    ksk: kskOut,
+    zsk: zskOut,
   };
 }
 

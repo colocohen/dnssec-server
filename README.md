@@ -103,7 +103,7 @@ import { createServer, buildDnssecMaterial } from 'dnssec-server';
 const DNSServer = require('dnssec-server');
 ```
 
-Dependencies: [`lemon-tls`](https://github.com/colocohen/lemon-tls) and [`quico`](https://github.com/colocohen/quico), used by the encrypted transports (DoT, DoQ).
+Dependencies: [`lemon-tls`](https://github.com/colocohen/lemon-tls) and [`quico`](https://github.com/colocohen/quico), used by the encrypted transports (DoT, DoQ); and `cryptographic-formats`, which reads and writes the keys' encodings (SPKI, PKCS#8, JWK) and converts a signer's DER signature to the r||s DNSSEC carries. The signing itself is `node:crypto`'s.
 
 
 # 🚀 Quick Start
@@ -186,6 +186,8 @@ See [Encrypted transports](#-encrypted-transports-dot-doq) for the TLS / QUIC ce
 | `autoDenial` | `true` | Add the NSEC proving a negative answer. `false` leaves negative answers without one. |
 | `autoDnskey` | `true` | Answer DNSKEY queries at the zone apex from the material. `false` passes them to the handler. |
 | `autoCds` | `true` | Answer CDS and CDNSKEY queries at the apex from the material. See [CDS / CDNSKEY](#8-cds--cdnskey--ds-updates-without-the-registrar). |
+| `signTimeout` | 1500 | Milliseconds to wait for an [external signer](#keys-behind-an-external-signer-hsm-kms-threshold-signing). |
+| `signRetries` | 0 | Retries for a signer error marked `retryable`. |
 
 ### `handler(req, res)`
 
@@ -323,14 +325,18 @@ A signed zone must also **prove** a negative answer — otherwise a validating r
 ```js
 import { buildDnssecMaterial } from 'dnssec-server';
 
-// New random keys
+// New random keys - algorithm 13 (ECDSA P-256) by default
 const material = buildDnssecMaterial({ signersName: 'example.com.' });
 
-// Or your existing private keys (base64 string or Uint8Array, P-256)
+// Algorithm 15 (Ed25519)
+const material = buildDnssecMaterial({ signersName: 'example.com.', algorithm: 15 });
+
+// Or your existing private keys: raw (32 bytes, base64 or Uint8Array - add algorithm: 15 for Ed25519),
+// PEM, or a KeyObject - from PEM the algorithm follows the key
 const material = buildDnssecMaterial({
   signersName: 'example.com.',
   ksk: { privateKey: 'BASE64-P256-PRIVATE-KEY' },
-  zsk: { privateKey: 'BASE64-P256-PRIVATE-KEY' }
+  zsk: { privateKey: fs.readFileSync('zsk.pem', 'utf8') }
 });
 ```
 
@@ -345,7 +351,28 @@ Output:
 }
 ```
 
-Algorithm 13 (ECDSA P-256 / SHA-256) and digest type 2 (SHA-256) — the modern defaults every validating resolver supports.
+Algorithm 13 (ECDSA P-256 / SHA-256) and digest type 2 (SHA-256) are the defaults - what every validating resolver supports.
+
+**Algorithm 15 (Ed25519, RFC 8080)** has short keys and signatures and is validated by the large public resolvers; check that your registrar accepts a DS with algorithm 15 before you use it. The KSK and the ZSK of a zone use the same algorithm: a DNSKEY set with two algorithms would oblige every RRset to carry a signature of each (RFC 4035 §2.2), and `buildDnssecMaterial` refuses the mix rather than produce a zone resolvers reject.
+
+### Keys behind an external signer (HSM, KMS, threshold signing)
+
+Either key can be an object that signs instead of a private key - the same interface as the author's other libraries:
+
+```js
+const material = buildDnssecMaterial({
+  signersName: 'example.com.',
+  ksk: {
+    publicKey: kskPublicPem,                       // SPKI PEM or DER, a KeyObject, or a JWK - P-256 or Ed25519
+    sign(bytes, cb) { hsm.sign(bytes, cb); },      // cb(err, signature): P-256 r||s (64 bytes) or DER; Ed25519 64 bytes
+  },
+  zsk: { privateKey: zskPem },                     // local - it signs every answer
+});
+```
+
+The DNSKEY, key tag and DS come from `publicKey`; `material.ksk.signer` is the object you gave (the material is then not JSON - keep it in memory, or build it again from the signer). Every signature is checked against `publicKey` before it is served; a signer that does not answer within `dnssec.signTimeout` (1500 ms), refuses, or returns a signature that does not verify is reported through `onError` (`err.code`: `SIGN_TIMEOUT`, `SIGN_REJECTED`, `SIGN_INVALID`), and that answer goes out unsigned - never with a bad signature. An error with `retryable: true` is tried again, `dnssec.signRetries` times (default 0). A burst of queries for the same RRset asks the signer once.
+
+Signing happens when a query needs it (then cached, `dnssec.cache`): fine for a signer that answers in milliseconds, such as an HSM next to the server. A signer that may wait - a remote service, an approval - needs the DNSKEY signatures made ahead of time; that is the next step on the [roadmap](#️-roadmap).
 
 
 ## 2. Keep the keys stable across restarts
@@ -419,7 +446,7 @@ Then [dnsviz.net](https://dnsviz.net) or [dnssec-debugger.verisignlabs.com](http
 
 A signature is a proof anyone can replay until it expires. Signing online makes short windows free, so new RRSIGs are valid for **7 days** (`signatureValidity`), and **30 days** over DNSKEY (`dnskeyValidity`). A cached signature is replaced once three quarters of its window is spent, so no resolver is handed one that is about to expire.
 
-ECDSA P-256 signing costs about 1–5 ms per RRset. With `cache`, identical RRsets reuse their signature.
+ECDSA P-256 signing costs about 1–5 ms per RRset, Ed25519 less. With `cache`, identical RRsets reuse their signature.
 
 ```js
 // Built-in in-memory LRU
@@ -429,7 +456,7 @@ dnssec: { keyCallback, cache: true, cacheMax: 5000 }
 dnssec: {
   keyCallback,
   cache: {
-    get(params, cb) {                // params: { name, type, class, keyTag, hash }
+    get(params, cb) {                // params: { name, type, class, keyTag, algorithm, hash }
       redis.get(params.hash + ':' + params.keyTag, (err, raw) => cb(err, raw ? JSON.parse(raw) : null));
     },
     set(params, value, cb) {         // value: { rrsig, expiration, inception }
@@ -1289,9 +1316,20 @@ Types preserved as raw (round-trip only): `EID`, `NIMLOC`, `ATMA`, `SINK`, `NINF
 - If you accept high QPS, consider sharding instances per region and delegating via NS.
 
 
+# 🧪 Testing
+
+```bash
+python3 -m pip install dnspython cryptography
+npm test                               # DNS_PYTHON=/path/to/python if it is not python3
+```
+
+The tests run a real server on a UDP port and check its answers with [dnspython](https://www.dnspython.org/) - a DNSSEC implementation of its own: every RRset in the answer and authority sections (records, SOA, the compact-denial NSEC, DNSKEY, CDS, CDNSKEY) validated against the DNSKEY set, that set validated against the KSK, and the DS checked against the KSK. They cover algorithms 13 and 15; raw, PEM and generated keys; external signers for either key (P-256 signatures as r||s or DER, Ed25519); a signer with the wrong key, one that refuses, one too slow, one returning a short signature (each reported, the answer unsigned, never a bad signature), one that succeeds on retry; a burst of queries asking the signer once; and a material stored by the previous version, served unchanged. Each protection was removed in turn to see a test fail.
+
+
 # 🗺️ Roadmap
 
 - 🛡️ **DNSSEC**
+  - DNSKEY / CDS signatures made ahead of time, in the background, for a KSK behind a signer that may take seconds or wait for an approval - with one server signing for many through a shared cache.
   - Key rollover helpers (ZSK/KSK) with automated timing — today one KSK and one ZSK per zone. CDS/CDNSKEY already carry a new KSK to the parent; what remains is publishing old and new keys side by side through the change.
 - 📦 **Operational**
   - Built-in response rate limiting (today: through the `'accept'` event).
@@ -1306,6 +1344,9 @@ Types preserved as raw (round-trip only): `EID`, `NIMLOC`, `ATMA`, `SINK`, `NINF
 
 
 # Troubleshooting FAQ
+
+**Q: `onError` says "DNSSEC: answers for … go out unsigned".**  
+A: The material `keyCallback` returned has no key for that answer - a ZSK or KSK with neither `privateKey` nor a signer, for example a material stored without its private keys. Answers go out, unsigned; with a DS at the parent, resolvers reject them. It is reported once a minute per zone (`err.code === 'DNSSEC_UNSIGNED'`), not per query.
 
 **Q: My domain returns SERVFAIL after enabling DNSSEC.**  
 A: The DS at your registrar must match your current KSK (key tag, algorithm, digest type, digest — or simply `material.ds`). The usual cause is keys that changed on restart: see [Keep the keys stable](#2-keep-the-keys-stable-across-restarts). Check the chain with [dnsviz.net](https://dnsviz.net).
