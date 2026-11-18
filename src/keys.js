@@ -9,14 +9,18 @@
  *     https://www.apache.org/licenses/LICENSE-2.0
  */
 
-import crypto from 'node:crypto';
 import * as SPKI from 'cryptographic-formats/spki';
 import * as PKCS8 from 'cryptographic-formats/pkcs8';
+import * as PEM from 'cryptographic-formats/pem';
 import * as SIG from 'cryptographic-formats/signature';
 import * as JWK from 'cryptographic-formats/jwk';
+import { p256 } from 'cryptographic-primitives/nist.js';
+import * as ED25519 from 'cryptographic-primitives/ed25519.js';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
 
-// node:crypto takes and gives a raw key only inside SPKI or PKCS#8 (or a
-// JWK); cryptographic-formats writes and reads that wrapping. The curve's name, as
+// The keys' encodings (SPKI, PKCS#8, PEM, JWK) are cryptographic-formats';
+// the keys themselves - generating, deriving the public key, signing,
+// verifying - cryptographic-primitives'. The curve's name, as
 // cryptographic-formats spells P-256.
 var P256 = 'secp256r1';
 
@@ -38,83 +42,97 @@ function toU8(x){
   if (x && x.buffer instanceof ArrayBuffer) return new Uint8Array(x.buffer, x.byteOffset || 0, x.byteLength);
   throw keyError('KEY_INVALID', 'a key must be bytes or base64');
 }
+
 function b64(u8){ return Buffer.from(u8).toString('base64'); }
 
+// A node:crypto KeyObject, told by its shape (it is read through its own
+// export(), so this module needs no node:crypto)
+function isKeyObject(x){
+  return !!x && typeof x === 'object' && typeof x.export === 'function' && typeof x.asymmetricKeyType === 'string' &&
+         (x.type === 'public' || x.type === 'private');
+}
 
 // --- public keys ---
 
-// A public key as Node takes it: SPKI PEM or DER, a KeyObject (public or
-// private), or a JWK.
+// A public key as the API takes it - SPKI PEM or DER, a KeyObject (public or
+// private), or a JWK - read by cryptographic-formats: { algorithm, curve, point }.
 function toPublicKeyObject(input){
-  if (input instanceof crypto.KeyObject) return input.type === 'private' ? crypto.createPublicKey(input) : input;
   try {
-    if (typeof input === 'string') return crypto.createPublicKey(input);
-    if (input instanceof Uint8Array || Buffer.isBuffer(input)) return crypto.createPublicKey({ key: Buffer.from(input), format: 'der', type: 'spki' });
-    if (input && typeof input === 'object' && input.kty) return crypto.createPublicKey({ key: Buffer.from(SPKI.to_der(JWK.to_key(input))), format: 'der', type: 'spki' });
+    if (isKeyObject(input)){
+      if (input.type === 'public') return SPKI.from_der(new Uint8Array(input.export({ type: 'spki', format: 'der' })));
+      return publicOfPrivate(PKCS8.from_der(new Uint8Array(input.export({ type: 'pkcs8', format: 'der' }))));
+    }
+    if (typeof input === 'string'){
+      var block = PEM.decode(input).filter(function(b){ return b.label === 'PUBLIC KEY'; })[0];
+      if (!block) throw new Error('no PUBLIC KEY block');
+      return SPKI.from_der(block.der);
+    }
+    if (input instanceof Uint8Array || Buffer.isBuffer(input)) return SPKI.from_der(toU8(input));
+    if (input && typeof input === 'object' && input.kty) return JWK.to_key(input);
   } catch (e){
     throw keyError('KEY_INVALID', 'publicKey cannot be read: ' + e.message);
   }
   throw keyError('KEY_INVALID', 'publicKey: SPKI PEM or DER, a KeyObject, or a JWK');
 }
 
+// The public key of a private one (cryptographic-formats' PKCS#8 shape)
+function publicOfPrivate(p){
+  if (p.algorithm === 'Ed25519') return { algorithm: 'Ed25519', point: ED25519.get_public_key_sync(p.scalar) };
+  if (p.algorithm === 'ecPublicKey' && p.curve === P256) return { algorithm: 'ecPublicKey', curve: P256, point: p.point || p256.get_public_key_sync(p.scalar, false) };
+  return { algorithm: p.algorithm, curve: p.curve };
+}
+
 // → { algorithm, dnskey }: the DNSSEC algorithm, and the key as the DNSKEY
 // record carries it - P-256: x||y (64 bytes, the uncompressed point without
 // its 0x04); Ed25519: the 32-byte key.
-function dnskeyFromPublic(ko){
-  var spki = SPKI.from_der(ko.export({ type: 'spki', format: 'der' }));
+function dnskeyFromPublic(spki){
   if (spki.algorithm === 'Ed25519') return { algorithm: 15, dnskey: new Uint8Array(spki.point) };
-  if (ko.asymmetricKeyType === 'ec'){
+  if (spki.algorithm === 'ecPublicKey'){
     if (spki.curve !== P256) throw keyError('KEY_INVALID', 'an EC key for DNSSEC must be P-256 (algorithm 13), not ' + spki.curve);
-    return { algorithm: 13, dnskey: new Uint8Array(spki.point.subarray(1)) };
+    var point = spki.point;
+    if (point[0] !== 0x04) point = uncompressed(point);   // a compressed point: the same key
+    return { algorithm: 13, dnskey: new Uint8Array(point.subarray(1)) };
   }
-  throw keyError('KEY_INVALID', 'DNSSEC keys are P-256 (algorithm 13) or Ed25519 (algorithm 15), not ' + ko.asymmetricKeyType);
+  throw keyError('KEY_INVALID', 'DNSSEC keys are P-256 (algorithm 13) or Ed25519 (algorithm 15), not ' +
+                 ({ rsaEncryption: 'rsa', Ed448: 'ed448' }[spki.algorithm] || spki.algorithm));
 }
 
-// The public key back from what a DNSKEY carries
-function publicFromDnskey(algorithm, dnskey){
-  var der = algorithm === 15
-    ? SPKI.to_der({ algorithm: 'Ed25519', point: dnskey })
-    : SPKI.to_der({ algorithm: 'ecPublicKey', curve: P256, point: concat([0x04], dnskey) });
-  return crypto.createPublicKey({ key: Buffer.from(der), format: 'der', type: 'spki' });
+// A compressed P-256 point, uncompressed (04 || x || y)
+function uncompressed(point){
+  var xy = p256.decode_point_sync(point);
+  var hex = function(n){ return n.toString(16).padStart(64, '0'); };
+  return new Uint8Array(Buffer.from('04' + hex(xy.x) + hex(xy.y), 'hex'));
 }
-function concat(a, b){
-  var out = new Uint8Array(a.length + b.length);
-  out.set(a, 0);
-  out.set(b, a.length);
-  return out;
-}
-
 
 // --- local private keys: the raw 32 bytes the material keeps ---
 
-// A P-256 key needs no public point in its PKCS#8: node:crypto derives it.
-function privateFromRaw(algorithm, raw){
+function publicFromRaw(algorithm, raw){
   if (raw.length !== 32) throw keyError('KEY_INVALID', 'a raw DNSSEC private key is 32 bytes (got ' + raw.length + ')');
-  var der = algorithm === 15
-    ? PKCS8.to_der({ algorithm: 'Ed25519', scalar: raw })
-    : PKCS8.to_der({ algorithm: 'ecPublicKey', curve: P256, scalar: raw });
-  return crypto.createPrivateKey({ key: Buffer.from(der), format: 'der', type: 'pkcs8' });
-}
-
-// A private key's raw scalar, read out of its PKCS#8
-function rawOf(ko){
-  return new Uint8Array(PKCS8.from_der(ko.export({ type: 'pkcs8', format: 'der' })).scalar);
+  return algorithm === 15 ? ED25519.get_public_key_sync(raw) : p256.get_public_key_sync(raw, false).subarray(1);
 }
 
 function generateRaw(algorithm){
-  return rawOf(algorithm === 15 ? crypto.generateKeyPairSync('ed25519').privateKey
-                                : crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey);
+  return new Uint8Array(algorithm === 15 ? ED25519.keygen_sync().sk : p256.keygen_sync().sk);
 }
 
-// A private key given as PEM or a KeyObject → { algorithm, raw }
+// A private key given as PEM (PKCS#8 or SEC 1) or a KeyObject → { algorithm, raw }
 function rawFromPrivate(input){
-  var ko;
-  try { ko = input instanceof crypto.KeyObject ? input : crypto.createPrivateKey(input); }
-  catch (e){ throw keyError('KEY_INVALID', 'privateKey cannot be read: ' + e.message); }
-  var alg = dnskeyFromPublic(crypto.createPublicKey(ko)).algorithm;
-  return { algorithm: alg, raw: rawOf(ko) };
+  var p;
+  try {
+    if (isKeyObject(input)) p = PKCS8.from_der(new Uint8Array(input.export({ type: 'pkcs8', format: 'der' })));
+    else {
+      var blocks = PEM.decode(String(input));
+      for (var i = 0; i < blocks.length && !p; i++){
+        if (blocks[i].encrypted || blocks[i].label === 'ENCRYPTED PRIVATE KEY') throw new Error('the key is encrypted');
+        if (blocks[i].label === 'PRIVATE KEY') p = PKCS8.from_der(blocks[i].der);
+        else if (blocks[i].label === 'EC PRIVATE KEY') p = PKCS8.sec1_from_der(blocks[i].der);
+      }
+      if (!p) throw new Error('no private key in the PEM');
+    }
+  } catch (e){ throw keyError('KEY_INVALID', 'privateKey cannot be read: ' + e.message); }
+  var alg = dnskeyFromPublic(publicOfPrivate(p)).algorithm;
+  return { algorithm: alg, raw: new Uint8Array(p.scalar) };
 }
-
 
 // --- one key, as buildDnssecMaterial is given it ---
 //
@@ -140,7 +158,7 @@ function readKey(spec, defaultAlgorithm, role){
     var alg, raw;
     if (spec && spec.privateKey != null){
       var pk = spec.privateKey;
-      var pemOrObject = pk instanceof crypto.KeyObject || (typeof pk === 'string' && pk.indexOf('-----BEGIN') >= 0);
+      var pemOrObject = isKeyObject(pk) || (typeof pk === 'string' && pk.indexOf('-----BEGIN') >= 0);
       if (pemOrObject){
         var r = rawFromPrivate(pk);
         alg = r.algorithm; raw = r.raw;
@@ -156,7 +174,7 @@ function readKey(spec, defaultAlgorithm, role){
       raw = generateRaw(alg);
     }
     if (!ALGORITHMS[alg]) throw keyError('KEY_INVALID', 'DNSSEC algorithm ' + alg + ' is not supported (13: P-256, 15: Ed25519)');
-    var pubKey = dnskeyFromPublic(crypto.createPublicKey(privateFromRaw(alg, raw))).dnskey;
+    var pubKey = new Uint8Array(publicFromRaw(alg, raw));
     return { algorithm: alg, publicKey: pubKey, privateRaw: raw, signer: null };
   } catch (e){
     if (!e.code) e.code = 'KEY_INVALID';
@@ -168,29 +186,50 @@ function readKey(spec, defaultAlgorithm, role){
 
 // --- signing ---
 
-// Local keys, made into KeyObjects once
-var keyObjects = new Map();
-function localKey(algorithm, privateKey){
+// Local keys: the library's signer, made once per key
+var signers = new Map();
+function localSigner(algorithm, privateKey){
   var id = algorithm + '|' + (typeof privateKey === 'string' ? privateKey : b64(privateKey));
-  var ko = keyObjects.get(id);
-  if (!ko){
-    ko = privateFromRaw(algorithm, toU8(privateKey));
-    if (keyObjects.size >= 1000) keyObjects.delete(keyObjects.keys().next().value);
-    keyObjects.set(id, ko);
+  var sg = signers.get(id);
+  if (!sg){
+    var raw = toU8(privateKey);
+    if (raw.length !== 32) throw keyError('KEY_INVALID', 'a raw DNSSEC private key is 32 bytes (got ' + raw.length + ')');
+    sg = algorithm === 15 ? ED25519.signer_create(raw) : p256.signer_create(raw);
+    if (signers.size >= 1000){ var old = signers.keys().next().value; signers.get(old).wipe(); signers.delete(old); }
+    signers.set(id, sg);
   }
-  return ko;
+  return sg;
 }
 
-var publicObjects = new Map();
-function publicKeyOf(key){
+// Public keys: the library's verifier, made once per key
+var verifiers = new Map();
+function verifierOf(key){
   var id = key.algorithm + '|' + key.publicKey;
-  var ko = publicObjects.get(id);
-  if (!ko){
-    ko = publicFromDnskey(Number(key.algorithm), toU8(key.publicKey));
-    if (publicObjects.size >= 1000) publicObjects.delete(publicObjects.keys().next().value);
-    publicObjects.set(id, ko);
+  var v = verifiers.get(id);
+  if (!v){
+    var pk = toU8(key.publicKey);
+    v = Number(key.algorithm) === 15 ? ED25519.verifier_create(pk, undefined, undefined, 'strict')
+                                     : p256.verifier_create(concat([0x04], pk));
+    if (verifiers.size >= 1000) verifiers.delete(verifiers.keys().next().value);
+    verifiers.set(id, v);
   }
-  return ko;
+  return v;
+}
+
+function concat(a, b){
+  var out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+function big(bytes){
+  var n = 0n;
+  for (var i = 0; i < bytes.length; i++) n = (n << 8n) | BigInt(bytes[i]);
+  return n;
+}
+function be32(n){
+  return new Uint8Array(Buffer.from(n.toString(16).padStart(64, '0'), 'hex'));
 }
 
 // A P-256 ECDSA signature in DER (SEQUENCE { INTEGER r, INTEGER s }) → r||s,
@@ -200,12 +239,21 @@ function derToRaw(der){
   catch (e){ return null; }
 }
 
+// A signature (r||s for P-256) over payload by key's public key
 function verify(key, payload, sig){
   try {
-    var pub = publicKeyOf(key);
-    if (Number(key.algorithm) === 15) return crypto.verify(null, Buffer.from(payload), pub, Buffer.from(sig));
-    return crypto.verify('sha256', Buffer.from(payload), { key: pub, dsaEncoding: 'ieee-p1363' }, Buffer.from(sig));
+    if (Number(key.algorithm) === 15) return verifierOf(key).verify_sync(payload, sig) === true;
+    if (sig.length !== 64) return false;
+    return verifierOf(key).verify_message_sync(sha256_sync, payload, { r: big(sig.subarray(0, 32)), s: big(sig.subarray(32)) }) === true;
   } catch (e){ return false; }
+}
+
+// One local signature: Ed25519's 64 bytes, or P-256's r||s
+function signLocal(algorithm, privateKey, payload){
+  var sg = localSigner(algorithm, privateKey);
+  if (algorithm === 15) return sg.sign_sync(payload);
+  var rs = sg.sign_message_sync(sha256_sync, payload);
+  return concat(be32(rs.r), be32(rs.s));
 }
 
 // Sign the RRSIG payload with a key from the material:
@@ -221,15 +269,12 @@ function signPayload(key, payload, opts, cb){
   if (!key.signer){
     var sig;
     try {
-      var ko = localKey(algorithm, key.privateKey);
-      sig = algorithm === 15
-        ? crypto.sign(null, Buffer.from(payload), ko)
-        : crypto.sign('sha256', Buffer.from(payload), { key: ko, dsaEncoding: 'ieee-p1363' });
+      sig = signLocal(algorithm, key.privateKey, toU8(payload));
     } catch (e){
       if (!e.code) e.code = 'KEY_INVALID';
       return setImmediate(cb, e);
     }
-    return setImmediate(cb, null, new Uint8Array(sig));
+    return setImmediate(cb, null, sig);
   }
 
   var timeout = opts && opts.signTimeout > 0 ? opts.signTimeout : 1500;

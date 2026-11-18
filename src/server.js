@@ -20,7 +20,8 @@ import dgram from 'node:dgram';
 import net from 'node:net';
 import { createQuicServer, createTcpListener } from 'quico';
 import lemonTls from 'lemon-tls';
-import crypto from 'node:crypto';
+import { sha256_sync } from 'cryptographic-primitives/sha2.js';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
 import { EventEmitter } from 'node:events';
 
 import * as wire from './wire.js';
@@ -37,6 +38,11 @@ import * as keys from './keys.js';
 // Utilities
 // ---------------------------------------------------------------
 function toHex(u8){
+  // A digest per signed RRset: Node's hex encoder makes one string, where the
+  // loop made three per byte.
+  if (typeof Buffer !== 'undefined' && u8 instanceof Uint8Array) {
+    return Buffer.from(u8.buffer, u8.byteOffset, u8.length).toString('hex').toUpperCase();
+  }
   var s=''; for (var i=0;i<u8.length;i++){ var b=u8[i]; s += (b<16?'0':'') + b.toString(16); }
   return s.toUpperCase();
 }
@@ -408,16 +414,21 @@ function finalizeWire(serverCtx, req, res){
 // The bytes an RRSIG signs (RFC 4034 §3.1.8.1): the RRSIG RDATA without its
 // signature, then the RRset in canonical form. Which algorithm signs them is
 // the key's business (keys.js).
+// Written straight into the payload: the signer's name goes through a
+// scratch buffer of the old temporary's size (so a name too long for it fails
+// the same way), and the header is written in place.
+var _signerNameBuf = new Uint8Array(256);
 function rrsigPayload(signer_name,rrset_bytes,algorithm,key_tag,sig_expiration,sig_inception,labels,rr_type,ttl){
 
-  var tmp = new Uint8Array(256);
+  var tmp = _signerNameBuf;
   var off = 0;
-  off = wire.encodeName(tmp, off, signer_name, {});
-  var signer_name_bytes = tmp.slice(0, off);
+  off = wire.encodeName(tmp, off, signer_name);
+  var signer_name_bytes = tmp.subarray(0, off);
 
   var rr_type_code = wire.type_to_code[rr_type.toUpperCase()] || 0;
 
-  var header_bytes = new Uint8Array(18);
+  var payload = new Uint8Array(18 + signer_name_bytes.length + rrset_bytes.length);
+  var header_bytes = payload;
   header_bytes[0] = (rr_type_code >> 8) & 0xff;
   header_bytes[1] = rr_type_code & 0xff;
   header_bytes[2] = algorithm;
@@ -441,21 +452,29 @@ function rrsigPayload(signer_name,rrset_bytes,algorithm,key_tag,sig_expiration,s
   header_bytes[16] = (key_tag >> 8) & 0xff;
   header_bytes[17] = key_tag & 0xff;
 
-  var payload = new Uint8Array(
-    header_bytes.length + signer_name_bytes.length + rrset_bytes.length
-  );
-  payload.set(header_bytes, 0);
-  payload.set(signer_name_bytes, header_bytes.length);
-  payload.set(rrset_bytes, header_bytes.length + signer_name_bytes.length);
+  payload.set(signer_name_bytes, 18);
+  payload.set(rrset_bytes, 18 + signer_name_bytes.length);
   return payload;
 }
 
 // RFC 4034 §3.1.3: the Labels field is the number of labels in the owner name,
 // NOT counting the root and NOT counting a leftmost '*' (wildcard) label.
 function rrsigLabelCount(name){
-  var l = String(name || '.').replace(/\.$/, '').split('.').filter(Boolean);
-  if (l.length && l[0] === '*') l.shift();
-  return l.length;
+  // Counted in place: the non-empty dot-separated parts of the name without
+  // one trailing dot, less a leading '*' part.
+  var s = String(name || '.');
+  var end = s.length > 0 && s.charCodeAt(s.length - 1) === 46 ? s.length - 1 : s.length;
+  var n = 0, firstStar = false;
+  for (var i = 0; i < end; ){
+    var dot = s.indexOf('.', i);
+    if (dot < 0 || dot > end) dot = end;
+    if (dot > i){
+      if (n === 0) firstStar = (dot - i === 1 && s.charCodeAt(i) === 42);
+      n++;
+    }
+    i = dot + 1;
+  }
+  return firstStar ? n - 1 : n;
 }
 
 // Group records into RRsets by (name, type, class). RRSIG/OPT are never re-signed.
@@ -1193,7 +1212,7 @@ function createServer(options, handler){
 
   var serverCtx = {
     server: server,
-    cookies: createCookieJar(options.cookies, crypto.randomBytes),
+    cookies: createCookieJar(options.cookies, randomBuffer),
     onError: onError,
     udp4: null, 
     udp6: null, 
@@ -1546,7 +1565,14 @@ function createServer(options, handler){
 
 
 function sha256(data){
-  return new Uint8Array(crypto.createHash('sha256').update(Buffer.from(data)).digest());
+  return sha256_sync(data);
+}
+
+// Random bytes as a Buffer (the cookie jar reads them as one), a view of
+// the library's array
+function randomBuffer(n){
+  var b = random_bytes_sync(n);
+  return Buffer.from(b.buffer, b.byteOffset, b.byteLength);
 }
 
 

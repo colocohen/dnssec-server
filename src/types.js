@@ -32,18 +32,43 @@ var _nameDv = new DataView(_nameBuf.buffer);
 
 // Strict IPv4 parser shared by A / WKS / L32 encoders — fails loudly instead of
 // silently emitting garbage bytes for malformed addresses.
+// Valid: exactly four dot-separated parts, each 1-3 ASCII digits, each <= 255.
+// Read in place — an A record is encoded for every answer, and splitting and
+// matching each part made five strings and four regex runs per address.
 function ipv4ToBytesStrict(s, rrType){
   var str = String(s == null ? '' : s);
-  var p = str.split('.');
-  if (p.length !== 4) throw new Error(rrType + ': invalid IPv4 address "' + str + '"');
   var out = new Uint8Array(4);
-  for (var i = 0; i < 4; i++){
-    if (!/^\d{1,3}$/.test(p[i])) throw new Error(rrType + ': invalid IPv4 address "' + str + '"');
-    var n = +p[i];
-    if (n > 255) throw new Error(rrType + ': invalid IPv4 address "' + str + '"');
-    out[i] = n;
+  var part = 0, digits = 0, n = 0, ok = true;
+  for (var i = 0; i < str.length && ok; i++){
+    var c = str.charCodeAt(i);
+    if (c === 46){                                  // '.'
+      if (digits === 0 || part === 3) ok = false;
+      else { out[part++] = n; n = 0; digits = 0; }
+    } else if (c >= 48 && c <= 57 && digits < 3){
+      n = n * 10 + (c - 48); digits++;
+      if (n > 255) ok = false;
+    } else ok = false;
   }
+  if (!ok || part !== 3 || digits === 0) throw new Error(rrType + ': invalid IPv4 address "' + str + '"');
+  out[3] = n;
   return out;
+}
+
+// Writes `len` characters of `name` from `start` as a label when they are all
+// ASCII (UTF-8 is then the characters themselves) and fit in `out`; returns
+// the new offset, or -1 to leave the label to the TextEncoder path, which also
+// keeps its errors (a label that does not fit throws from out.set()).
+function writeAsciiLabel(out, off, name, start, len){
+  if (len === 0 || len > 63 || off + 1 + len > out.length) return -1;
+  for (var k = 0; k < len; k++) if (name.charCodeAt(start + k) > 0x7F) return -1;
+  out[off++] = len;
+  for (var j = 0; j < len; j++) out[off + j] = name.charCodeAt(start + j);
+  return off + len;
+}
+
+function isAsciiString(s){
+  for (var i = 0; i < s.length; i++) if (s.charCodeAt(i) > 0x7F) return false;
+  return true;
 }
 
 
@@ -52,12 +77,21 @@ function encodeName(out, off, name/*, _dictIgnored */){
   name = String(name || '.');
   if (name === '.') { out[off++] = 0; return off; }
   if (name[name.length-1] !== '.') name += '.';
-  const labels = name.slice(0, -1).split('.');
-  for (const lab of labels){
-    const b = __te.encode(lab);
-    if (b.length === 0 || b.length > 63) throw new Error('label len');
-    out[off++] = b.length;
-    out.set(b, off); off += b.length;
+  // Label by label in place: an ASCII label is written from the string, any
+  // other through the TextEncoder as before. Splitting and encoding every
+  // label allocated an array, a string and a Uint8Array per label, for the
+  // same few names in every answer.
+  var u8 = out instanceof Uint8Array;
+  for (var start = 0; start < name.length; ){
+    var dot = name.indexOf('.', start);              // the name ends with '.'
+    var next = u8 ? writeAsciiLabel(out, off, name, start, dot - start) : -1;
+    if (next < 0){
+      const b = __te.encode(name.slice(start, dot));
+      if (b.length === 0 || b.length > 63) throw new Error('label len');
+      out[off++] = b.length;
+      out.set(b, off); off += b.length;
+    } else off = next;
+    start = dot + 1;
   }
   out[off++] = 0;
   return off;
@@ -72,7 +106,10 @@ function decodeName(buf, off){
   let hops = 0;
 
   while (true){
-    if (off >= max) throw new Error('decodeName overflow');
+    // !(off < max), not off >= max: a caller that read past the end (NAPTR's
+    // length octets) passes NaN, which off >= max let through, and the loop
+    // then never ended — one query hung the server
+    if (!(off < max)) throw new Error('decodeName overflow');
     const len = buf[off++];
 
     if (len === 0) break;
@@ -92,11 +129,16 @@ function decodeName(buf, off){
     if ((len & 0xC0) !== 0) throw new Error('decodeName label type');
     if (off + len > max) throw new Error('decodeName label overflow');
 
-    // subarray (no copy) + fast path for pure-ASCII labels (the overwhelming majority)
-    var seg = buf.subarray(off, off + len);
+    // fast path for pure-ASCII labels (the overwhelming majority): from a
+    // Buffer (a received query) the label string is read in place, latin1
+    // being ASCII here; otherwise through a subarray (no copy)
     var isAscii = true;
-    for (var ai = 0; ai < len; ai++){ if (seg[ai] > 0x7F){ isAscii = false; break; } }
-    labels.push(isAscii ? String.fromCharCode.apply(null, seg) : __td.decode(seg));
+    for (var ai = off; ai < off + len; ai++){ if (buf[ai] > 0x7F){ isAscii = false; break; } }
+    if (isAscii && typeof Buffer !== 'undefined' && Buffer.isBuffer(buf)) labels.push(buf.toString('latin1', off, off + len));
+    else {
+      var seg = buf.subarray(off, off + len);
+      labels.push(isAscii ? String.fromCharCode.apply(null, seg) : __td.decode(seg));
+    }
     off += len;
   }
 
@@ -955,6 +997,7 @@ types.LP = {
 
 
 export {
+  writeAsciiLabel, isAsciiString,
   types,
   encodeName,
   decodeName,

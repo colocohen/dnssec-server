@@ -19,7 +19,6 @@
   <a href="https://www.npmjs.com/package/dnssec-server">
     <img src="https://img.shields.io/npm/v/dnssec-server?color=blue" alt="npm">
   </a>
-  <img src="https://img.shields.io/badge/status-in%20development-yellow" alt="status">
   <img src="https://img.shields.io/github/license/colocohen/dnssec-server?color=brightgreen" alt="license">
 </p>
 
@@ -103,7 +102,7 @@ import { createServer, buildDnssecMaterial } from 'dnssec-server';
 const DNSServer = require('dnssec-server');
 ```
 
-Dependencies: [`lemon-tls`](https://github.com/colocohen/lemon-tls) and [`quico`](https://github.com/colocohen/quico), used by the encrypted transports (DoT, DoQ); and `cryptographic-formats`, which reads and writes the keys' encodings (SPKI, PKCS#8, JWK) and converts a signer's DER signature to the r||s DNSSEC carries. The signing itself is `node:crypto`'s.
+Dependencies: [`lemon-tls`](https://github.com/colocohen/lemon-tls) and [`quico`](https://github.com/colocohen/quico), used by the encrypted transports (DoT, DoQ); and `cryptographic-formats`, which reads and writes the keys' encodings (SPKI, PKCS#8, JWK) and converts a signer's DER signature to the r||s DNSSEC carries; and `cryptographic-primitives`, which signs and verifies (Ed25519, ECDSA P-256), hashes and supplies the random bytes. Nothing uses `node:crypto`; a `KeyObject` you pass is still accepted.
 
 
 # 🚀 Quick Start

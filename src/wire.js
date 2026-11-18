@@ -24,6 +24,7 @@ import {
 
 import {
   types,
+  writeAsciiLabel, isAsciiString,
   encodeName,
   decodeName,
   makeNameRdataEncoder,
@@ -34,7 +35,13 @@ import {
 
 import { parseEDNSOptions, buildEDNSOptions } from './edns.js';
 
-import crypto from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
+
+// A random DNS message ID, 0..65535
+function random_id(){
+  var b = random_bytes_sync(2);
+  return (b[0] << 8) | b[1];
+}
 
 // ===== Header encode/decode =====
 function decodeHeader(buf){
@@ -63,8 +70,10 @@ function decodeHeader(buf){
     bytes: 12
   };
 }
-function encodeHeader(h){
-  var out = new Uint8Array(12), dv = new DataView(out.buffer);
+// `into` (encodeMessage): write the 12 bytes at the start of the shared
+// encode buffer instead of a new array that is then copied there.
+function encodeHeader(h, into){
+  var out = into ? _encodeBuf : new Uint8Array(12), dv = into ? _encodeDv : new DataView(out.buffer);
   var f = 0;
   if (h.qr) f |= 0x8000;
   f |= ((h.opcode|0)&0xF) << 11;
@@ -91,6 +100,7 @@ function encodeNameCompressed(out, off, name, dict){
   name = String(name||'.');
   if (name === '.') { out[off++] = 0; return off; }
   if (name[name.length-1] !== '.') name += '.';
+  if (out instanceof Uint8Array && isAsciiString(name)) return encodeAsciiNameCompressed(out, off, name, dict);
   // labels
   var labels = name.slice(0,-1).split('.');
   for (var i=0;i<labels.length;i++){
@@ -116,6 +126,36 @@ function encodeNameCompressed(out, off, name, dict){
   return off;
 }
 
+// The same for an all-ASCII name, without the split, the per-label joins and
+// the TextEncoder: the suffix from a label on is name.slice(at), and ASCII
+// lowercases character for character, so its key is a slice of the name
+// lowercased once. Same keys, same bytes, same errors (a label that cannot
+// be written in place goes through encodeName's TextEncoder path, as above).
+function encodeAsciiNameCompressed(out, off, name, dict){
+  var lower = name.toLowerCase();
+  for (var at = 0; at < name.length; ){
+    var key = at === 0 ? lower : lower.slice(at);
+    if (dict.hasOwnProperty(key)){
+      var ptr = dict[key];
+      out[off++] = 0xC0 | ((ptr >> 8) & 0x3F);
+      out[off++] = ptr & 0xFF;
+      return off;
+    }
+    if (off < 0x4000) dict[key] = off;
+    var dot = name.indexOf('.', at);
+    var next = writeAsciiLabel(out, off, name, at, dot - at);
+    if (next < 0){
+      var lb = __te.encode(name.slice(at, dot));
+      if (lb.length === 0 || lb.length > 63) throw new Error('label len');
+      out[off++] = lb.length;
+      out.set(lb, off); off += lb.length;
+    } else off = next;
+    at = dot + 1;
+  }
+  out[off++] = 0; // root
+  return off;
+}
+
 // ===== Question encode/decode =====
 function decodeQuestion(buf, off){
   var n = decodeName(buf, off); off = n.off;
@@ -127,7 +167,7 @@ function decodeQuestion(buf, off){
 }
 function encodeQuestion(out, off, q, dict){
     off = encodeNameCompressed(out, off, q.name, dict);
-    var dv = new DataView(out.buffer);
+    var dv = out === _encodeBuf ? _encodeDv : new DataView(out.buffer);
     const tcode = (typeof q.type  === 'string') ? (type_to_code[q.type]  || 0) : (q.type|0);
     const ccode = (typeof q.class === 'string') ? (class_to_code[q.class]|| 1) : (q.class==null ? 1 : (q.class|0));
     dv.setUint16(off, tcode & 0xFFFF, false); off += 2;
@@ -208,7 +248,7 @@ function decodeRR(buf, off){
 function encodeRR(out, off, rr, dict){
   // rr.type can be string or number
   var tcode = (typeof rr.type === 'string') ? (type_to_code[rr.type]||0) : (rr.type|0);
-  var dv = new DataView(out.buffer);
+  var dv = out === _encodeBuf ? _encodeDv : new DataView(out.buffer);
 
   // OPT special (EDNS)
   if (tcode === 41){
@@ -295,6 +335,7 @@ function decodeMessage(buf){
 
 // Shared encode buffer — reused across calls (safe: encodeMessage is synchronous)
 var _encodeBuf = new Uint8Array(65535);
+var _encodeDv = new DataView(_encodeBuf.buffer);   // its view, for the writers below (a DataView per record before)
 
 function encodeMessage(msg){
   var qd = (msg.questions||[]).length;
@@ -305,7 +346,7 @@ function encodeMessage(msg){
   if (msg.edns && !hasExplicitOPT) ar += 1;
 
   var h = Object.assign({
-    id: crypto.randomInt(0, 65536),
+    id: random_id(),
     qr:false, opcode:0, aa:false, tc:false, rd:true, ra:false, z:false, ad:false, cd:false, rcode:0,
     qdcount: qd, ancount: an, nscount: ns, arcount: ar
   }, msg.header||{});
@@ -325,7 +366,7 @@ function encodeMessage(msg){
   h = Object.assign({}, h, { rcode: fullRcode & 0xF });
 
   var out = _encodeBuf, off = 0;
-  out.set(encodeHeader(h), off); off += 12;
+  encodeHeader(h, true); off += 12;
 
   var dict = {}; // for name compression
 
@@ -408,17 +449,21 @@ function encodeRDATACanonical(rr){
   return enc(canonicalizeRdataNames(rr));
 }
 
+// Scratch for the owner name, the size of the per-call buffer it replaces (a
+// name too long for it fails the same way); copied out before returning.
+var _canonNameBuf = new Uint8Array(256);
+
 function encodeRRCanonical(rr, originalTTL){
   const typeStr = typeof rr.type==='string' ? rr.type : code_to_type[rr.type];
   const tcode   = typeof rr.type==='string' ? (type_to_code[typeStr]||0) : (rr.type|0);
   const ccode   = typeof rr.class==='string' ? (class_to_code[rr.class]||1) : (rr.class==null?1:(rr.class|0));
   const rdata   = encodeRDATACanonical(rr);
 
-  const nameBuf = new Uint8Array(256);
+  const nameBuf = _canonNameBuf;
   const noff = encodeNameCanonical(nameBuf, 0, rr.name);
 
   const out = new Uint8Array(noff + 10 + rdata.length);
-  out.set(nameBuf.slice(0, noff), 0);
+  out.set(nameBuf.subarray(0, noff), 0);
   const dv = new DataView(out.buffer);
   let o = noff;
   dv.setUint16(o, tcode & 0xFFFF, false); o+=2;
@@ -461,7 +506,10 @@ function buildRRsetBytesFromAnswers(answers){
     return a.rdata.length - b.rdata.length;
   });
 
-  // concatenate into a single Uint8Array — this is what gets signed
+  // concatenate into a single Uint8Array — this is what gets signed. One
+  // record (most RRsets) is its own canonical form: a fresh array no one
+  // else holds, so it is returned rather than copied.
+  if (items.length === 1) return items[0].full;
   let total=0; for (const it of items) total+=it.full.length;
   const out = new Uint8Array(total);
   let off=0; for (const it of items){ out.set(it.full, off); off+=it.full.length; }
